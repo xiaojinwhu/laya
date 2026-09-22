@@ -1,0 +1,22 @@
+{
+  "train_file": "examples/multilabel_intent/data/mixsnips/train.jsonl",
+  "dev_file": "examples/multilabel_intent/data/mixsnips/dev.jsonl",
+  "test_file": "examples/multilabel_intent/data/mixsnips/test.jsonl",
+  "labels_file": "examples/multilabel_intent/data/mixsnips/labels.json",
+  "output_dir": "examples/multilabel_intent/runs/mixsnips_laya",
+
+  "init": "convaiinnovations/laya",
+
+  "epochs": 2,
+  "micro_batch": 8,
+  "grad_accum": 4,
+  "group_size": 4,
+  "lr_encoder": 2.5e-5,
+  "lr_head": 1e-4,
+  "sigma_start": 0.4,
+  "sigma_end": 0.1,
+  "w_sph": 0.75,
+
+  "threshold_mode": "global",
+  "patience": 0
+}

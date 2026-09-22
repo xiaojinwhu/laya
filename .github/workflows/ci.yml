@@ -46,6 +46,9 @@ jobs:
           python tests/test_router.py
           python tests/test_criteria.py
 
+      - name: Multi-label pipeline (trains a tiny random encoder on CPU, no network)
+        run: python tests/test_multilabel.py
+
   lint:
     name: lint
     runs-on: ubuntu-latest

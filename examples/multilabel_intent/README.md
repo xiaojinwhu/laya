@@ -1,0 +1,218 @@
+# 多标签意图分类训练 pipeline
+
+一句话里可以同时包含多个意图（"放首爵士乐，**再**帮我订个两人位"）。Laya 原生的三种决策原语里，
+`choice` 是 softmax 单选，`noul` 是单个二值判断，都不能在**一次前向**里输出"每个意图是否出现"。
+`laya.multilabel` 在不改动模型结构的前提下补上了这个原语，并沿用仓库里的 RLCD 训练算法
+（`notebooks/laya_finetune_typed_decisions_2xT4_kaggle.ipynb`）。
+
+```
+laya/multilabel/
+  schema.py        标签体系 + 问题措辞
+  data.py          JSONL 读取、token 预算规划、序列构造（复用 laya.common.build_sequence）
+  rlcd.py          RLCD 损失（notebook 训练步的函数化移植）+ 多标签形式
+  calibration.py   温度拟合（LBFGS）+ 判定阈值搜索
+  metrics.py       micro/macro-F1、exact match、ECE、Brier …
+  trainer.py       训练主流程（单卡 / torchrun 多卡），输出标准 Laya checkpoint
+  agent.py         推理：MultiLabelAgent
+  __main__.py      命令行：train / eval / predict
+examples/multilabel_intent/
+  prepare_data.py  MixSNIPS / MixATIS / 由 MASSIVE 合成的多意图数据（51 种语言，含中文）
+tests/test_multilabel.py   无需联网的单元 + 端到端测试
+```
+
+## 算法：如何把多标签放进 Laya
+
+**序列布局**与 `choice` 完全相同，只是在最前面多放一个**阈值选项**（`none`）：
+
+```
+[CLS] choice question: <instructions> [SEP] [MASK] none: … [MASK] intent_0: … [MASK] intent_1: … [SEP] utterance [SEP]
+```
+
+模型在每个 `[MASK]` 位置打一个分 `z`。标签 *i* 的概率定义为它与阈值选项的**两两 softmax**：
+
+```
+P(intent_i) = softmax([z_none, z_i])[1] = sigmoid(z_i − z_none)
+```
+
+这恰好就是一个 logits 为 `[false, true] = [z_none, z_i]` 的 `noul` 问题。所以一条含 K 个标签的序列
+＝ **在同一次前向里回答的 K 个 noul 问题**，RLCD 算法可以原封不动地套在每个 (样本, 标签) 决策上：
+
+| 步骤 | notebook（单问题） | 这里（每个标签决策） |
+|---|---|---|
+| 策略 | 选项 logits 上的高斯 `N(z, σ²)`，噪声做零均值投影 | 同左，作用在 `[z_none, z_i]` 这一对上 |
+| 采样 | 每题 `G=4` 个带噪分布 `q = softmax(z+ε)` | 同左 |
+| 奖励 | `proper_reward`：log score + 0.75 × spherical score（严格 proper） | 直接调用 `laya.common.proper_reward`，qtype=noul |
+| 优势 | 组内相对基线（GRPO 风格），全 batch 标准化 | **每个标签决策各自一组基线** → 信用分配精确到标签 |
+| 损失 | `−adv · log N(z+ε; z, σ²)` + 1.0 × soft CE | 同左（soft CE 即逐标签 BCE，支持软标签） |
+| 探索 | σ 0.4 → 0.1 | 同左（按 update 线性退火） |
+| 优化 | AdamW，encoder 2.5e-5 / head 1e-4，cosine，梯度累积，clip 1.0 | 同左，另有可选 warmup |
+| 校准 | 训练后 LBFGS 拟合温度 | 同左，但在**留出的 dev** 上拟合，并额外搜索判定阈值 |
+
+`tests/test_multilabel.py` 里有一项测试把 notebook 的训练步逐字抄下来，验证 `rlcd_loss` 在相同随机种子下
+**损失与梯度完全一致**；另一项验证只用 RL 项（关掉 CE）时概率会收敛到软标签本身（0.7 → 0.70），
+这正是"严格 proper scoring rule"应有的性质。
+
+这样设计带来的几个好处：
+
+- **结构零改动**：权重、配置、目录布局都是标准 Laya checkpoint，`laya.load(out_dir)` 照常可用，
+  原有的 choice / score / noul 问题仍能回答。
+- **零样本可用**：Laya 预训练时见过大量 "other / none of the above" 选项，阈值选项的语义与之一致
+  （下方实测：未训练时 micro-F1 已有 0.73）。
+- **标签可以分块**：softmax 单选一旦把选项拆到多条序列，概率就失去归一化；而这里每个标签只和
+  **自己序列里的阈值**比较，所以标签很多、放不进一条序列时可以自动拆成多条
+  （README 里 Banking77 那类"77 个选项挤在 256 token 里"的问题因此不存在）。
+- **选项顺序增强**：每个 epoch 重新打乱标签顺序（阈值选项固定在首位），抑制位置偏置。
+
+## 快速开始
+
+```bash
+uv venv .venv && uv pip install --python .venv/bin/python -e . tokenizers
+```
+
+### 1. 准备数据
+
+```bash
+python examples/multilabel_intent/prepare_data.py mixsnips --out examples/multilabel_intent/data/mixsnips
+python examples/multilabel_intent/prepare_data.py mixatis  --out examples/multilabel_intent/data/mixatis
+python examples/multilabel_intent/prepare_data.py massive  --out examples/multilabel_intent/data/massive_zh --lang zh-CN
+```
+
+自有数据只需要两种文件：
+
+```jsonl
+{"text": "放首爵士乐，再帮我订个两人位", "labels": ["play_music", "book_restaurant"]}
+{"text": "明天会下雨吗", "labels": ["weather_query"]}
+{"state": {"utterance": "…", "channel": "app"}, "labels": {"refund": 1.0, "complaint": 0.6}}
+```
+
+- `text`（字符串）或 `state`（任意 JSON，和 Laya 的 state 一样）；
+- `labels` 是名字列表，或 `{名字: 概率}` 的**软标签**（RLCD 的奖励和 CE 都支持）；没有任何意图就给 `[]`。
+
+`labels.json`（可选，但**强烈建议写描述**——模型是靠读选项文字来判断的）：
+
+```json
+{
+  "instructions": "Which intents does the user express in `utterance`? Several may apply.",
+  "labels": {"play_music": "play a song, album or artist", "book_restaurant": "reserve a table"}
+}
+```
+
+也可以只是名字列表 `["a", "b"]` 或 `{名字: 描述}`；不提供时从数据里自动收集标签名。
+
+### 2. 训练
+
+```bash
+# 从 Laya 英文 checkpoint 微调
+python -m laya.multilabel train --config examples/multilabel_intent/config.mixsnips.json
+
+# 中文 / 多语言：用 multilingual 子目录（mmBERT-base）
+python -m laya.multilabel train --config examples/multilabel_intent/config.massive_zh.json
+
+# 任意 HF 掩码语言模型 encoder 也可以（决策头随机初始化）
+python -m laya.multilabel train --init hfl/chinese-roberta-wwm-ext --lr-head 5e-4 --warmup-ratio 0.05 \
+    --train-file train.jsonl --dev-file dev.jsonl --labels-file labels.json --output-dir out
+
+# 多卡（与 notebook 相同的 DDP 方式）
+torchrun --standalone --nproc_per_node=2 -m laya.multilabel train --config cfg.json
+```
+
+`--config` 里的每个字段都可以用同名命令行参数覆盖（`--epochs 3 --pos-weight 2`）。常用字段：
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `init` / `subfolder` | `convaiinnovations/laya` | Laya checkpoint（hub id 或目录），或任意 HF encoder 名 |
+| `dev_file` / `dev_ratio` | – / 0.1 | 选模型、拟合温度和阈值用；不给 dev 就从 train 切 10% |
+| `epochs` `micro_batch` `grad_accum` | 4 / 8 / 4 | 与 notebook 一致 |
+| `group_size` `sigma_start` `sigma_end` `w_sph` | 4 / 0.4 / 0.1 / 0.75 | RLCD 超参，与 notebook 一致 |
+| `rl_weight` `ce_weight` | 1.0 / 1.0 | 两项损失的权重；`rl_weight=0` 退化为纯 BCE 基线 |
+| `pos_weight` | 1.0 | 标签很稀疏（几十上百个标签）时调大，给正例更高权重 |
+| `labels_per_seq` | 自动 | 每条序列放多少标签；默认在位置上限内尽量全放，放不下自动分块 |
+| `state_budget` | 128 | 给输入文本预留的 token 数，长文本调大 |
+| `threshold_mode` | `global` | `fixed`(0.5) / `global`(一个阈值, 最大化 micro-F1) / `per_label` |
+| `freeze_encoder` | false | 只训决策头，显存小很多 |
+| `gradient_checkpointing` | true | 与 notebook 一致。421M 全参数 fp32 微调、micro-batch 8：开 ≈ 9 GB，关 ≈ 15 GB；显存富余时关掉可快约 30% |
+| `patience` | 0 | dev 连续 N 个 epoch 不涨就停 |
+| `limit_train` `limit_eval` | – | 调试用的小规模运行 |
+
+训练过程：epoch 0 先评一次初始权重（也作为候选）→ 每个 epoch 在 dev 上选最优 → 重新载入最优权重 →
+在 dev 上拟合温度、搜索阈值 → 评 dev / test。输出目录：
+
+```
+out/model.safetensors  encoder/  tokenizer/      标准 Laya checkpoint
+out/rl_agent_config.json                         多了 "multilabel"（标签、温度、阈值）和 "training" 两节
+out/metrics.json  out/train_log.jsonl
+```
+
+### 3. 评估与预测
+
+```bash
+python -m laya.multilabel eval    --model out --data test.jsonl
+python -m laya.multilabel predict --model out --text "play some jazz and book a table for two"
+python -m laya.multilabel predict --model out --input in.jsonl --output pred.jsonl
+```
+
+```python
+from laya.multilabel import MultiLabelAgent
+
+agent = MultiLabelAgent("out")            # 本地目录或 hub id
+res = agent.predict("play some jazz by miles davis and book a table for two")
+res["labels"]          # ['BookRestaurant', 'PlayMusic']
+res["probabilities"]   # {'AddToPlaylist': 0.003, 'BookRestaurant': 0.98, ...}  已做温度校准
+res["confidence"]      # 0.95，所有标签判定同时正确的概率（独立性假设），可用于转人工的门控
+
+agent.predict_batch(list_of_texts, batch_size=32)
+agent.agent.predict(state, questions)     # 同一份权重仍是普通的 laya.Agent
+```
+
+## 实测
+
+全部在一台 M4 MacBook（16 GB，MPS）上完成，只为验证 pipeline，不是调参后的最优结果。
+
+**MixSNIPS**（7 个意图，每句 1–3 个）。dev / test 各取前 500 条；exact match = 整个意图集合完全正确。
+
+| 初始化 | 训练量 | dev micro-F1 | test micro-F1 | test exact match | test ECE |
+|---|---|---|---|---|---|
+| Laya 英文 checkpoint（421M），**零样本** | 0 | 0.706 | – | – | – |
+| Laya 英文 checkpoint，RLCD 微调 | 1,600 条（训练集的 4%）× 1 epoch，100 次更新，约 10 分钟 | **0.980** | **0.955** | **0.880** | 0.013 |
+| BERT-mini（11M，裸 encoder + 新决策头），RLCD | 4,000 条 × 3 epoch，约 2 分钟 | 0.952 | 0.921 | 0.760 | 0.017 |
+| 同上，但 `rl_weight=0`（纯 BCE 对照） | 同上 | 0.953 | 0.919 | 0.768 | 0.015 |
+
+- 从 Laya checkpoint 出发收益很明显：零样本就有 0.71，用 4% 的数据训 100 步，test micro-F1 0.955。
+  这些数字来自极小的训练预算，**不能**和论文里全量训练的结果直接比较。
+- **RLCD 与纯 BCE 在这个规模上打平**（0.921 vs 0.919，差异在噪声范围内）。RL 项在这里没有带来可见的
+  精度提升；它的理论价值在校准和软标签上（奖励的最优点就是真实概率），需要更大规模的对照才能下结论。
+  想要更快更稳的基线，把 `rl_weight` 设为 0 即可。
+- 校准：温度拟合后 ECE 在 0.013–0.017，`confidence` 可以直接用来做转人工门控
+  （域外句子 "what is the capital of france" → 不输出任何意图，confidence 0.57）。
+- 微调后同一份权重交给原版 `laya.Agent` 回答普通问题，抽查结果与微调前几乎一致
+  （noul 0.44 → 0.40、0.92 → 0.91，score 1.27 → 1.20）。长时间微调后是否仍然如此没有验证。
+- BERT-mini 那个 checkpoint 在**完整** test（2,199 条）上：micro-F1 0.924，exact match 0.764，ECE 0.015；
+  最弱的是 `SearchCreativeWork`（F1 0.78），它和 `PlayMusic` / `SearchScreeningEvent` 语义重叠最大。
+
+**MASSIVE zh-CN 合成多意图**（60 个意图，每句 1–3 个，dev / test 各取前 300–600 条）。这组难得多：标签多、
+每个标签只有几百条样本，而且标签描述是英文（`alarm set`）、句子是中文。
+
+| 初始化 | 训练量 | 序列 | dev micro-F1 | test micro-F1 | test exact match | test ECE |
+|---|---|---|---|---|---|---|
+| Laya multilingual（322M），**零样本** | 0 | 60 标签放进 1 条（`head_max_len` 自动 256 → 536） | 0.316 | 0.271 | 0.037 | 0.012 |
+| Laya multilingual，RLCD 微调 | 800 条 × 1 epoch，**50 次更新**，约 15 分钟 | 同上 | 0.556 | 0.561 | 0.140 | 0.003 |
+| `hfl/rbt3`（3 层中文 RoBERTa，裸 encoder） | 6,000 条 × 3 epoch，3,375 次更新，约 58 分钟 | BERT 只有 512 位置 → **自动分成 3 条 × 21 标签** | 0.617 | 0.601 | 0.142 | 0.004 |
+
+- 两条路径（长上下文单序列 / 短上下文自动分块）都能正常训练、校准、保存和推理。
+- 这里的分数都远未收敛（rbt3 每个 epoch 还在涨：0.51 → 0.59 → 0.62；multilingual 只跑了 50 步），
+  只说明 pipeline 在 60 标签、中文场景下工作正常，**不代表这个任务能达到的水平**。要认真做中文，建议：
+  multilingual checkpoint + 全量数据 + 多个 epoch + **中文标签描述** + 一张 CUDA 卡。
+- `epochs=0` 就是"只校准不训练"：零样本评估一个 checkpoint 并写出温度和阈值。
+
+**显存**（421M 全参数、fp32、AdamW、micro-batch 8、序列约 170 token，MPS 实测）：开梯度检查点峰值约 9 GB，
+不开约 15 GB（16 GB 的机器会直接开始换页，看起来像"卡死"）。CUDA 上有混合精度，会更省。
+
+## 注意事项
+
+- **标签描述很重要**。模型通过阅读 `名字: 描述` 来判断，`atis_flight` 这种名字最好配上一句话描述。
+- **中文及其他非英文数据请用 `subfolder: "multilingual"`**（英文 checkpoint 读不了非拉丁文字，见主 README）。
+- **标签很多时**（60+）：序列会变长，`head_max_len` / `max_len` 会自动放大并写回 checkpoint 配置；
+  encoder 位置上限不够（如 BERT 的 512）时自动分块，推理时各块仍在同一个 batch 里一次前向完成。
+- macOS 上 `torchrun --standalone` 可能因主机名解析失败而卡住，改用
+  `torchrun --nnodes=1 --nproc_per_node=2 --master-addr=127.0.0.1 --master-port=29533 …`。
+- 混合精度只在 CUDA 上启用（T4 用 fp16 + GradScaler，Ampere 及以上用 bf16）；MPS / CPU 走 fp32。
