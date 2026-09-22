@@ -54,6 +54,9 @@ P(intent_i) = softmax([z_none, z_i])[1] = sigmoid(z_i − z_none)
 **损失与梯度完全一致**；另一项验证只用 RL 项（关掉 CE）时概率会收敛到软标签本身（0.7 → 0.70），
 这正是"严格 proper scoring rule"应有的性质。
 
+RLCD 常被当成 GRPO 的变体，其实两者只共享"组内相对基线"这一个部件；逐阶段的对照和为什么它能得到校准的概率，
+见 [RLCD_vs_GRPO.md](RLCD_vs_GRPO.md)。
+
 这样设计带来的几个好处：
 
 - **结构零改动**：权重、配置、目录布局都是标准 Laya checkpoint，`laya.load(out_dir)` 照常可用，
