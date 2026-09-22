@@ -80,12 +80,75 @@ def _dtype(name: str) -> Optional[torch.dtype]:
     return {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}.get(name)
 
 
-def load_backbone(init: str, subfolder: Optional[str], token: Optional[str], dtype: str = "fp32"):
-    """(text backbone module, its config, note) for a hub id or directory that is not a Laya checkpoint.
+TEXT_PREFIXES = ("model.language_model.", "language_model.")
 
-    Decoders are loaded through their causal-LM class with the *text* config, which makes the
-    multimodal checkpoints (Qwen3.5, Gemma 4) give up only their language model; if that leaves
-    core weights unloaded, the whole model is loaded and its `language_model` taken instead.
+
+def _weight_files(init: str, subfolder: Optional[str], token: Optional[str]):
+    """Local safetensors files of a checkpoint (downloading only what is needed)."""
+    import glob
+    import json
+
+    from huggingface_hub import hf_hub_download, snapshot_download
+
+    if local_model_dir(init, subfolder):
+        return sorted(glob.glob(os.path.join(local_model_dir(init, subfolder), "*.safetensors")))
+    kw = {"token": token}
+    if subfolder:
+        kw["subfolder"] = subfolder
+    try:
+        index = hf_hub_download(init, "model.safetensors.index.json", **kw)
+        with open(index) as f:
+            names = sorted(set(json.load(f)["weight_map"].values()))
+    except Exception:  # noqa: BLE001 - single-file checkpoint
+        names = ["model.safetensors"]
+    pats = ["%s/%s" % (subfolder, n) for n in names] if subfolder else names
+    root = snapshot_download(init, allow_patterns=pats, token=token)
+    d = os.path.join(root, subfolder) if subfolder else root
+    return [os.path.join(d, n) for n in names]
+
+
+def load_text_backbone(init: str, subfolder: Optional[str], token: Optional[str], tcfg, dtype: Optional[torch.dtype]):
+    """The language model of a multimodal checkpoint, reading only its tensors from disk.
+
+    The vision/audio towers never enter memory, which is what makes Gemma 4 E2B (4.65B text
+    parameters next to 0.5B of towers) fit where the composite model would not. Raises when the
+    checkpoint does not carry a `language_model.` prefix or lacks tensors the text model needs.
+    """
+    from safetensors import safe_open
+    from transformers import AutoModel
+
+    kw = {"attn_implementation": "sdpa"}
+    if dtype is not None:
+        kw["dtype"] = dtype
+    model = AutoModel.from_config(tcfg, **kw)
+    expected = set(model.state_dict())
+    state, prefix = {}, None
+    for path in _weight_files(init, subfolder, token):
+        with safe_open(path, "pt") as f:
+            for key in f.keys():
+                for p in TEXT_PREFIXES:
+                    if key.startswith(p) and (prefix is None or prefix == p):
+                        prefix, name = p, key[len(p):]
+                        if name in expected:
+                            t = f.get_tensor(key)
+                            state[name] = t.to(dtype) if dtype is not None and t.is_floating_point() else t
+                        break
+    if prefix is None:
+        raise ValueError("no language_model tensors in %r" % init)
+    missing = expected - set(state)
+    if missing:
+        raise ValueError("%d text tensors missing from %r (e.g. %s)" % (len(missing), init, sorted(missing)[:2]))
+    model.load_state_dict(state, strict=False)  # extras (e.g. unused k/v of KV-shared layers) were skipped
+    return model
+
+
+def load_backbone(init: str, subfolder: Optional[str], token: Optional[str], dtype: str = "fp32"):
+    """(text backbone module, its config, layout, note) for a hub id or directory that is not a Laya checkpoint.
+
+    Decoders come through their causal-LM class with the *text* config. Multimodal checkpoints
+    (Qwen3.5, Gemma 4) contribute only their language model: through that class when transformers
+    maps the composite keys, else by reading the `language_model.` tensors directly, and only as a
+    last resort by loading the whole composite model and taking `.language_model`.
     """
     from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 
@@ -111,12 +174,18 @@ def load_backbone(init: str, subfolder: Optional[str], token: Optional[str], dty
         enc = getattr(clm, clm.base_model_prefix, None) or clm.model
         if tcfg is not config:
             note = "text backbone of a multimodal checkpoint"
-    except Exception as e:  # noqa: BLE001 - any failure here means "try the composite model"
-        full = AutoModel.from_pretrained(init, **load_kw)
-        enc = getattr(full, "language_model", None)
-        if enc is None:
-            raise ValueError("cannot find a text backbone in %r: %s" % (init, e))
-        note = "text backbone of a multimodal checkpoint (via language_model)"
+    except Exception as e:  # noqa: BLE001 - any failure here means "read the text tensors ourselves"
+        if tcfg is config:
+            raise
+        try:
+            enc = load_text_backbone(init, subfolder, token, tcfg, _dtype(dtype))
+            note = "text backbone of a multimodal checkpoint (language_model tensors only)"
+        except Exception as e2:  # noqa: BLE001 - last resort: the composite model
+            full = AutoModel.from_pretrained(init, **load_kw)
+            enc = getattr(full, "language_model", None)
+            if enc is None:
+                raise ValueError("cannot find a text backbone in %r: %s / %s" % (init, e, e2))
+            note = "text backbone of a multimodal checkpoint (via language_model)"
     # enc.config is the text config the layers were built with; never replace it (the layers keep
     # their own reference, so a swap desynchronises mask construction from the attention modules)
     return enc, enc.config, layout, note

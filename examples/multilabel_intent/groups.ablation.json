@@ -1,0 +1,9 @@
+{
+  "A. 基模（MixSNIPS，同一预算）": ["A_laya_en_rlcd", "A_laya_ml_rlcd", "A_modernbert_large_bare", "A_bertmini_rlcd", "A_qwen3_0.6b_lora", "A_qwen3.5_0.8b_lora", "A_gemma4_e2b_lora"],
+  "B. 目标函数：RLCD vs 纯 BCE": ["A_laya_en_rlcd", "B_laya_en_bce", "A_qwen3_0.6b_lora", "B_qwen3_0.6b_lora_bce", "A_bertmini_rlcd", "B_bertmini_bce"],
+  "C. 训练方式：全参 vs LoRA vs 冻结主干（Laya 英文 checkpoint）": ["A_laya_en_rlcd", "C_laya_en_lora16", "C_laya_en_frozen"],
+  "D. 决策头层数（Qwen3-0.6B，LoRA）": ["A_qwen3_0.6b_lora", "D_qwen3_0.6b_lora_head2"],
+  "E. 训练数据量（Laya 英文 checkpoint）": ["E_laya_en_n400", "A_laya_en_rlcd", "E_laya_en_n4000"],
+  "F. 问题构造（BERT-mini）": ["A_bertmini_rlcd", "F_bertmini_nodesc", "F_bertmini_noshuffle"],
+  "G. 中文 60 意图（MASSIVE zh 合成）": ["G_zh_laya_ml_rlcd", "G_zh_qwen3_0.6b_lora", "G_zh_rbt3_bare"]
+}

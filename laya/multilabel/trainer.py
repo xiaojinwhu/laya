@@ -47,7 +47,8 @@ class TrainConfig:
     labels_file: Optional[str] = None   # label names/descriptions; inferred from the data if absent
     dev_ratio: float = 0.1              # carved from train when there is no dev_file
     limit_train: Optional[int] = None
-    limit_eval: Optional[int] = None
+    limit_eval: Optional[int] = None    # dev (and test, unless limit_test is set)
+    limit_test: Optional[int] = None    # 0 = the whole test file even when limit_eval is set
     output_dir: str = "laya_multilabel"
 
     # what to start from: a Laya checkpoint (hub id or directory), a masked-LM encoder, or a
@@ -335,7 +336,10 @@ def train(cfg: TrainConfig) -> Dict:
     if cfg.limit_train:
         train_ex = train_ex[:cfg.limit_train]
     if cfg.limit_eval:
-        dev_ex, test_ex = dev_ex[:cfg.limit_eval], test_ex[:cfg.limit_eval]
+        dev_ex = dev_ex[:cfg.limit_eval]
+    n_test = cfg.limit_eval if cfg.limit_test is None else cfg.limit_test
+    if n_test:
+        test_ex = test_ex[:n_test]
     y_dev = np.array([e.target for e in dev_ex], dtype=np.float32)
 
     # ---- model
@@ -518,6 +522,10 @@ def train(cfg: TrainConfig) -> Dict:
                 update += 1
                 if update % 10 == 1:
                     note_memory()
+                    if device.type == "mps":
+                        # the MPS caching allocator keeps growing across a run; on a 16 GB machine that
+                        # ends in swap, which looks like a hang. Returning cached blocks is cheap.
+                        torch.mps.empty_cache()
 
             stats["loss"] = loss.item()
             for key in sums:

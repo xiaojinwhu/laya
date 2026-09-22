@@ -1,0 +1,21 @@
+{
+  "train_file": "examples/multilabel_intent/data/mixsnips/train.jsonl",
+  "dev_file": "examples/multilabel_intent/data/mixsnips/dev.jsonl",
+  "test_file": "examples/multilabel_intent/data/mixsnips/test.jsonl",
+  "labels_file": "examples/multilabel_intent/data/mixsnips/labels.json",
+
+  "init": "convaiinnovations/laya",
+
+  "limit_train": 1600,
+  "limit_eval": 500,
+  "limit_test": 0,
+  "epochs": 1,
+  "micro_batch": 8,
+  "grad_accum": 2,
+  "eval_batch_size": 16,
+  "log_every": 20,
+  "seed": 42,
+
+  "tracker": "trackio",
+  "project": "laya-multilabel-ablation"
+}

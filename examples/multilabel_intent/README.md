@@ -251,7 +251,9 @@ project 默认取 `--out` 的目录名，`trackio show --project <名字>` 就�
 
 ## 实测
 
-全部在一台 M4 MacBook（16 GB，MPS）上完成，只为验证 pipeline，不是调参后的最优结果。
+**完整的消融实验报告见 [REPORT.md](REPORT.md)**（19 个变体、七个轴、统一预算，全部记录在 trackio 项目
+`laya-multilabel-ablation`）。下面是开发过程中的早期验证数字，全部在一台 M4 MacBook（16 GB，MPS）上完成，
+只为验证 pipeline，不是调参后的最优结果。
 
 **MixSNIPS**（7 个意图，每句 1–3 个）。dev / test 各取前 500 条；exact match = 整个意图集合完全正确。
 

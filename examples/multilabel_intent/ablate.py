@@ -89,6 +89,7 @@ def run_variant(base: str, variant: dict, out_dir: str, python: str, dry: bool) 
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
         for line in proc.stdout:
             log.write(line)
+            log.flush()  # keep OUT/NAME/train.log live for anyone watching a long run
             if line.startswith(("init:", "data:", "sequence:", "schedule:", "epoch", "calibration", "dev ", "test ", "saved", "Traceback")):
                 print("   " + line.rstrip(), flush=True)
         rc = proc.wait()
@@ -134,17 +135,30 @@ def fmt(row: dict, key: str, spec: str) -> str:
         return str(v)
 
 
-def write_report(out_dir: str, rows):
+def table(rows, columns=COLUMNS) -> str:
+    lines = ["| " + " | ".join(h for _, h, _ in columns) + " |", "|" + "---|" * len(columns)]
+    for r in rows:
+        lines.append("| " + " | ".join(fmt(r, k, s) for k, _, s in columns) + " |")
+    return "\n".join(lines)
+
+
+def write_report(out_dir: str, rows, groups=None):
+    """results.jsonl + results.md; `groups` ({title: [variant names]}) adds one table per group."""
     with open(os.path.join(out_dir, "results.jsonl"), "w") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
-    lines = ["| " + " | ".join(h for _, h, _ in COLUMNS) + " |", "|" + "---|" * len(COLUMNS)]
-    for r in rows:
-        lines.append("| " + " | ".join(fmt(r, k, s) for k, _, s in COLUMNS) + " |")
-    table = "\n".join(lines)
+    by_name = {r["name"]: r for r in rows}
+    parts = ["# Ablation results\n"]
+    for title, names in (groups or {}).items():
+        sel = [by_name[n] for n in names if n in by_name]
+        missing = [n for n in names if n not in by_name]
+        parts.append("## %s\n\n%s\n" % (title, table(sel)))
+        if missing:
+            parts.append("not run: %s\n" % ", ".join("`%s`" % n for n in missing))
+    parts.append("## All variants\n\n%s\n" % table(rows))
     with open(os.path.join(out_dir, "results.md"), "w") as f:
-        f.write("# Ablation results\n\n%s\n" % table)
-    print("\n" + table)
+        f.write("\n".join(parts))
+    print("\n" + table(rows))
     print("\nwritten: %s/results.md, results.jsonl" % out_dir)
 
 
@@ -164,10 +178,15 @@ def main():
     r.add_argument("--dry-run", action="store_true")
     p = sub.add_parser("report")
     p.add_argument("--out", required=True)
+    p.add_argument("--groups", help='JSON {"section title": [variant names]} -> one table per section')
     args = ap.parse_args()
 
     if args.cmd == "report":
-        write_report(args.out, collect(args.out))
+        groups = None
+        if args.groups:
+            with open(args.groups, encoding="utf-8") as f:
+                groups = json.load(f)
+        write_report(args.out, collect(args.out), groups)
         return
     variants = []
     if args.grid:
