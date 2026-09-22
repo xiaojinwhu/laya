@@ -32,6 +32,7 @@ from .data import Budget, CachedTokenizer, Example, build_items, infer_labels, p
 from .metrics import multilabel_metrics
 from .rlcd import multilabel_rlcd_loss
 from .schema import LabelSchema, load_labels
+from .tracking import Tracker, flat
 
 CHECKPOINT_FILES = ["rl_agent_config.json", "model.safetensors", "encoder/*", "tokenizer/*"]
 ADAPTER_DIR = "adapter"
@@ -96,6 +97,12 @@ class TrainConfig:
     pos_weight: float = 1.0
     freeze_encoder: bool = False
     gradient_checkpointing: bool = True  # as in the notebook: full fine-tuning of 421M params on 16 GB
+
+    # experiment tracking (trackio and wandb share one API); train_log.jsonl is written regardless
+    tracker: str = "none"               # none | trackio | wandb
+    project: str = "laya-multilabel"
+    run_name: Optional[str] = None      # default: the output directory's name
+    tracker_space: Optional[str] = None  # trackio: HF Space id to sync the dashboard to; wandb: entity
 
     # selection, calibration, runtime
     threshold_mode: str = "global"      # fixed | global | per_label
@@ -408,6 +415,13 @@ def train(cfg: TrainConfig) -> Dict:
     log_path = os.path.join(cfg.output_dir, "train_log.jsonl")
     if main:
         open(log_path, "w").close()
+    tracker = Tracker(cfg.tracker, cfg.project, cfg.run_name or os.path.basename(os.path.normpath(cfg.output_dir)),
+                      dict({k: v for k, v in asdict(cfg).items() if k != "token"},
+                           layout=base.layout, params_m=round(n_params / 1e6, 1), trainable_m=round(n_trainable / 1e6, 2),
+                           labels=len(schema), n_train=len(train_ex), n_dev=len(dev_ex), n_test=len(test_ex)),
+                      cfg.tracker_space, enabled=main)
+    if tracker.url:
+        say("tracking: %s" % tracker.url)
 
     def log(rec: Dict):
         if main:
@@ -454,9 +468,10 @@ def train(cfg: TrainConfig) -> Dict:
         say("epoch 0 (before training) | dev micro-F1 %.4f @%.2f | exact %.4f"
             % (dev["micro_f1"], dev["threshold"], dev["exact_match"]))
         log({"epoch": 0, "dev": dev})
+        tracker.log(dict(flat("dev", dev), epoch=0), step=0)
 
     # ---- RLCD
-    update, epoch = 0, 0
+    update, epoch, gstep = 0, 0, 0  # gstep: micro-batches seen over the whole run, the tracker's x-axis
     for epoch in range(1, cfg.epochs + 1):
         rng = random.Random(cfg.seed + epoch)  # identical on every rank so the shards line up
         items = []
@@ -469,6 +484,7 @@ def train(cfg: TrainConfig) -> Dict:
         batches = [mine[i:i + cfg.micro_batch] for i in range(0, len(mine), cfg.micro_batch)]
 
         sums, seen = {"loss": 0.0, "loss_rl": 0.0, "loss_ce": 0.0, "reward": 0.0}, 0
+        window, last_logged = dict(sums), 0  # running sums since the last tracker log
         optimizer.zero_grad(set_to_none=True)
         for bi, chunk in enumerate(batches):
             sigma = cfg.sigma_start + (cfg.sigma_end - cfg.sigma_start) * update / max(1, total_updates - 1)
@@ -506,11 +522,17 @@ def train(cfg: TrainConfig) -> Dict:
             stats["loss"] = loss.item()
             for key in sums:
                 sums[key] += stats[key]
+                window[key] += stats[key]
             seen += 1
+            gstep += 1
             if main and seen % cfg.log_every == 0:
                 say("  epoch %d/%d | step %d/%d | loss %.4f (rl %.4f, ce %.4f) | reward %.3f | sigma %.3f | lr %.2e"
                     % (epoch, cfg.epochs, seen, len(batches), stats["loss"], stats["loss_rl"],
                        stats["loss_ce"], stats["reward"], sigma, scheduler.get_last_lr()[0]))
+                n_win = seen - last_logged
+                tracker.log(dict({"train/%s" % k: v / n_win for k, v in window.items()},
+                                 **{"train/sigma": sigma, "train/lr": scheduler.get_last_lr()[0], "epoch": epoch}), step=gstep)
+                window, last_logged = {k: 0.0 for k in window}, seen
 
         rec = {"epoch": epoch, "minutes": round((time.time() - t0) / 60, 2),
                "train": {k: round(v / max(1, seen), 4) for k, v in sums.items()}}
@@ -522,6 +544,8 @@ def train(cfg: TrainConfig) -> Dict:
                    rec["dev"]["threshold"], rec["dev"]["exact_match"], rec["minutes"],
                    "  <- best" if best_epoch == epoch else ""))
             log(rec)
+            tracker.log(dict(flat("dev", rec["dev"]), **flat("epoch_train", rec["train"]), epoch=epoch,
+                             minutes=rec["minutes"], best_epoch=best_epoch), step=gstep)
         if distributed:
             flag = torch.tensor([int(cfg.patience > 0 and stale >= cfg.patience)], device=device)
             dist.broadcast(flag, 0)
@@ -588,12 +612,17 @@ def train(cfg: TrainConfig) -> Dict:
         }
         with open(os.path.join(cfg.output_dir, "metrics.json"), "w") as f:
             json.dump(report, f, indent=2, ensure_ascii=False)
+        final = {"final/temperature": temperature, "final/best_epoch": best_epoch}
         for split in ("dev", "test"):
             if split in report:
                 m = report[split]
                 say("%-4s | micro-F1 %.4f (P %.4f, R %.4f) | macro-F1 %.4f | exact match %.4f | ECE %.4f | Brier %.4f"
                     % (split, m["micro_f1"], m["micro_precision"], m["micro_recall"], m["macro_f1"],
                        m["exact_match"], m["ece"], m["brier"]))
+                final.update(flat("final/" + split, {k: v for k, v in m.items() if k != "per_label"}))
+        final.update(flat("run", report["run"]))
+        tracker.log(final, step=gstep)
+        tracker.finish()
         say("saved to %s (best epoch %d)" % (cfg.output_dir, best_epoch))
 
     if distributed:

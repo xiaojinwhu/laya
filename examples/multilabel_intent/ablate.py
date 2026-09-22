@@ -9,6 +9,7 @@ A grid file is a JSON list of {"name": ..., "overrides": {TrainConfig field: val
 variant trains in its own process (`python -m laya.multilabel train --config BASE --<override> ..`)
 so memory is returned between runs, writes to OUT/NAME, and is skipped when OUT/NAME/metrics.json
 already exists (delete it to rerun). `report` gathers the metrics into results.jsonl + results.md.
+`--tracker trackio` (or wandb) logs every variant as a run named after it; `trackio show` compares.
 """
 import argparse
 import json
@@ -156,6 +157,9 @@ def main():
     r.add_argument("--set", action="append", default=[], metavar="'NAME key=value,key=value'",
                    help="add a variant inline; repeatable")
     r.add_argument("--out", required=True)
+    r.add_argument("--tracker", choices=["none", "trackio", "wandb"],
+                   help="log every variant to this tracker (run name = variant name)")
+    r.add_argument("--project", help="tracker project; default: the --out directory's name")
     r.add_argument("--python", default=sys.executable)
     r.add_argument("--dry-run", action="store_true")
     p = sub.add_parser("report")
@@ -172,6 +176,11 @@ def main():
     variants += [parse_set(s) for s in args.set]
     if not variants:
         sys.exit("no variants: give --grid and/or --set")
+    if args.tracker or args.project:
+        shared = {"tracker": args.tracker or "trackio",
+                  "project": args.project or os.path.basename(os.path.normpath(args.out))}
+        for v in variants:
+            v["overrides"] = dict(shared, **v.get("overrides", {}))  # a variant's own setting wins
     os.makedirs(args.out, exist_ok=True)
     statuses = [run_variant(args.base, v, args.out, args.python, args.dry_run) for v in variants]
     if not args.dry_run:

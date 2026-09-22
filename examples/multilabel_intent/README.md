@@ -161,6 +161,7 @@ torchrun --standalone --nproc_per_node=2 -m laya.multilabel train --config cfg.j
 | `head_layers` | 自动 | 裸主干上的决策头层数：encoder 2 层，decoder 0 层（scorer 直接接 marker 的 hidden state） |
 | `load_dtype` | 自动 | 主干权重精度：LoRA + GPU/MPS 时 bf16，否则 fp32 |
 | `lora_r` `lora_alpha` `lora_dropout` `lora_targets` `lr_lora` | 0 / 32 / 0.05 / all-linear / 2e-4 | `lora_r > 0` 启用 LoRA（需要 `peft`），主干冻结，只训 adapter + 决策头；checkpoint 只存 adapter |
+| `tracker` `project` `run_name` `tracker_space` | none / laya-multilabel / 输出目录名 / – | 实验记录：`trackio` 或 `wandb`（见下文「实验记录」） |
 | `dev_file` / `dev_ratio` | – / 0.1 | 选模型、拟合温度和阈值用；不给 dev 就从 train 切 10% |
 | `epochs` `micro_batch` `grad_accum` | 4 / 8 / 4 | 与 notebook 一致 |
 | `group_size` `sigma_start` `sigma_end` `w_sph` | 4 / 0.4 / 0.1 / 0.75 | RLCD 超参，与 notebook 一致 |
@@ -208,7 +209,23 @@ agent.predict_batch(list_of_texts, batch_size=32)
 agent.agent.predict(state, questions)     # 同一份权重仍是普通的 laya.Agent
 ```
 
-### 4. 消融跑批
+### 4. 实验记录
+
+每个 run 目录里始终有 `train_log.jsonl`（逐 epoch）和 `metrics.json`（最终指标 + 参数量、显存、耗时、延迟），
+不依赖任何服务。要对比多次实验，接 **trackio**（本地 SQLite + 网页 dashboard，`pip install trackio`）或 wandb，
+两者 API 相同：
+
+```bash
+python -m laya.multilabel train --config cfg.json --tracker trackio --project my-intents --run-name qwen_lora16
+trackio show --project my-intents          # 打开 dashboard；多个 run 叠在一张图上比较
+```
+
+记录的内容：`train/*`（每 `log_every` 步一次：loss、rl、ce、reward、σ、lr）、`dev/*` 和 `epoch_train/*`（每 epoch）、
+`final/dev|test/*`（校准后的最终指标）、`run/*`（参数量、显存、耗时、延迟），config 里是完整的 TrainConfig。
+`--tracker-space <user/space>` 可以把 trackio dashboard 同步到一个 HF Space（wandb 下这个参数是 entity）。
+DDP 下只有 rank 0 记录。
+
+### 5. 消融跑批
 
 ```bash
 # 内联定义变体：名字 + 覆盖 TrainConfig 字段
@@ -226,7 +243,8 @@ python examples/multilabel_intent/ablate.py report --out runs/ablation      # �
 
 每个变体在独立进程里训练（内存在变体之间归还），写到 `OUT/NAME/`，已有 `metrics.json` 的变体自动跳过（删掉即重跑）。
 结束后生成 `results.md` / `results.jsonl`：变体、基模、布局、LoRA、参数量、dev/test F1、exact match、ECE、最佳 epoch、
-训练时长、峰值显存、推理延迟（batch 1 / batched）。
+训练时长、峰值显存、推理延迟（batch 1 / batched）。加 `--tracker trackio` 则每个变体以自己的名字记成一个 run，
+project 默认取 `--out` 的目录名，`trackio show --project <名字>` 就能把整张矩阵的曲线叠起来看。
 
 ## 实测
 

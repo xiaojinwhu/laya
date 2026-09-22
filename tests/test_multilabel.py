@@ -427,6 +427,49 @@ if HAVE_GEMMA4:
 else:
     print("   SKIP gemma4/* (this transformers has no gemma4)")
 
+# ---------------------------------------------------------------- 8. experiment tracking
+head("8. Experiment tracking (trackio when installed; the adapter itself needs nothing)")
+from laya.multilabel.tracking import Tracker, flat  # noqa: E402
+
+ok("tracking/flat nests with slashes and drops non-numbers",
+   flat("dev", {"micro_f1": 0.5, "per_label": {"a": {"f1": 1.0}}, "name": "x", "ok": True})
+   == {"dev/micro_f1": 0.5, "dev/per_label/a/f1": 1.0})
+none = Tracker("none", "p", "r", {})
+none.log({"x": 1}, step=0)
+none.finish()
+ok("tracking/none is a no-op", none.url is None)
+try:
+    Tracker("mlflow", "p", "r", {})
+    ok("tracking/unknown tracker is rejected", False)
+except ValueError:
+    ok("tracking/unknown tracker is rejected", True)
+os.environ["TRACKIO_DIR"] = os.path.join(tmp.name, "trackio")  # must be set before trackio is first imported
+try:
+    import trackio  # noqa: F401
+    HAVE_TRACKIO = True
+except ImportError:
+    HAVE_TRACKIO = False
+if HAVE_TRACKIO:
+    import sqlite3
+
+    rep_t = train(TrainConfig(train_file=DATA, dev_file=DATA, labels_file=LABELS_FILE, init=DEC,
+                              output_dir=os.path.join(tmp.name, "out_trk"), device="cpu", epochs=3, micro_batch=8,
+                              grad_accum=1, lr_encoder=1e-3, lr_head=1e-3, log_every=2, tracker="trackio",
+                              project="laya-test", run_name="tiny"))
+    db = os.path.join(tmp.name, "trackio", "laya-test.db")
+    con = sqlite3.connect(db)
+    n_rows = con.execute("select count(*) from metrics where run_name = 'tiny'").fetchone()[0]
+    last = json.loads(con.execute("select metrics from metrics where run_name = 'tiny' order by step desc, id desc limit 1")
+                      .fetchone()[0])
+    cfg_row = json.loads(con.execute("select config from configs where run_name = 'tiny'").fetchone()[0])
+    con.close()
+    ok("tracking/trackio has per-step and per-epoch rows", n_rows >= 3 + 3, n_rows)
+    ok("tracking/final metrics match metrics.json", abs(last["final/test/micro_f1"] - rep_t["test"]["micro_f1"]) < 1e-9
+       if "final/test/micro_f1" in last else abs(last["final/dev/micro_f1"] - rep_t["dev"]["micro_f1"]) < 1e-9, last)
+    ok("tracking/config is recorded", cfg_row.get("lr_head") == 1e-3 and cfg_row.get("layout") == "causal")
+else:
+    print("   SKIP tracking/trackio (not installed)")
+
 # ---------------------------------------------------------------- summary
 head("SUMMARY")
 print("\n   %d passed, %d failed" % (len(PASS), len(FAIL)))
