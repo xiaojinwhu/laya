@@ -404,7 +404,8 @@ present in an utterance that may carry several. `laya.multilabel` adds that as a
 without touching the architecture: a threshold option is placed in front of the labels, each label
 is the two-way (`noul`) decision between the threshold and its own marker, and all K decisions are
 read from a single forward pass. Training is the same RLCD loop as the notebook, applied per label
-decision. The result is an ordinary Laya checkpoint.
+decision. The result is an ordinary Laya checkpoint. Decoder backbones (Qwen3, Qwen3.5, Gemma 4, ...)
+are supported through a second, causal sequence layout, optionally with LoRA adapters.
 
 ```bash
 python examples/multilabel_intent/prepare_data.py mixsnips --out examples/multilabel_intent/data/mixsnips

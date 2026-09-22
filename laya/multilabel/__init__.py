@@ -4,8 +4,9 @@
     python -m laya.multilabel predict --model out --text "play some jazz and book a table for two"
 """
 from .agent import MultiLabelAgent, load, score_states
+from .backbone import detect_layout, load_backbone, pick_marker
 from .calibration import fit_temperature, tune_thresholds
-from .data import Budget, Example, build_items, plan_budget, read_jsonl
+from .data import Budget, Example, build_causal_sequence, build_items, plan_budget, read_jsonl
 from .metrics import multilabel_metrics
 from .rlcd import label_logits, multilabel_pairs, multilabel_rlcd_loss, rlcd_loss
 from .schema import LabelSchema, load_labels
@@ -22,6 +23,10 @@ __all__ = [
     "read_jsonl",
     "plan_budget",
     "build_items",
+    "build_causal_sequence",
+    "detect_layout",
+    "load_backbone",
+    "pick_marker",
     "rlcd_loss",
     "multilabel_rlcd_loss",
     "multilabel_pairs",

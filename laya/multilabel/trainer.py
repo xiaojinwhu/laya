@@ -4,7 +4,9 @@ Follows `notebooks/laya_finetune_typed_decisions_2xT4_kaggle.ipynb`: two learnin
 (encoder / decision head), cosine decay, gradient accumulation, annealed exploration noise,
 DDP under `torchrun`, post-training temperature fitting, and a checkpoint in the standard Laya
 layout. What it adds is a held-out split for model selection and calibration, decision
-thresholds, and the multi-label question itself (see `rlcd.py`).
+thresholds, the multi-label question itself (see `rlcd.py`), and two things the notebook does
+not need: decoder backbones through the causal layout (see `data.py`, `backbone.py`) and LoRA
+adapters, which are saved on their own next to the decision head instead of as merged weights.
 """
 import contextlib
 import json
@@ -20,8 +22,11 @@ import numpy as np
 import torch
 
 from ..agent import _fix_tokenizer_config
-from ..common import build_model, collate_items
+from ..common import DecisionModel, build_model, collate_items
 from .agent import score_states
+from .backbone import (
+    apply_lora, ensure_pad, head_state_dict, load_backbone, param_counts, peak_memory_gb, pick_marker,
+)
 from .calibration import fit_temperature, sigmoid, tune_thresholds
 from .data import Budget, CachedTokenizer, Example, build_items, infer_labels, plan_budget, read_jsonl
 from .metrics import multilabel_metrics
@@ -29,6 +34,7 @@ from .rlcd import multilabel_rlcd_loss
 from .schema import LabelSchema, load_labels
 
 CHECKPOINT_FILES = ["rl_agent_config.json", "model.safetensors", "encoder/*", "tokenizer/*"]
+ADAPTER_DIR = "adapter"
 
 
 @dataclass
@@ -43,10 +49,21 @@ class TrainConfig:
     limit_eval: Optional[int] = None
     output_dir: str = "laya_multilabel"
 
-    # what to start from: a Laya checkpoint (hub id or directory) or any HF masked-LM encoder
+    # what to start from: a Laya checkpoint (hub id or directory), a masked-LM encoder, or a
+    # decoder (Qwen3, Qwen3.5, Gemma 3/4, ...); multimodal checkpoints contribute their text backbone
     init: str = "convaiinnovations/laya"
     subfolder: Optional[str] = None
-    head_layers: int = 2                # only used when `init` is a bare encoder
+    head_layers: Optional[int] = None   # bare backbones only; None = 2 for encoders, 0 for decoders
+    layout: Optional[str] = None        # encoder | causal; None = decided by the backbone type
+    marker_token: Optional[str] = None  # causal layout: the option marker; None = mask token, <|fim_pad|> or <opt>
+    load_dtype: str = "auto"            # bf16 | fp16 | fp32 for the backbone weights; auto = bf16 with LoRA on a GPU
+
+    # LoRA (needs `peft`); 0 = full fine-tuning. The adapter is saved on its own, never merged.
+    lora_r: int = 0
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05
+    lora_targets: str = "all-linear"    # or a comma list of module names, e.g. q_proj,k_proj,v_proj,o_proj
+    lr_lora: float = 2e-4
 
     # question wording; each overrides the labels file
     instructions: Optional[str] = None
@@ -94,10 +111,24 @@ class TrainConfig:
 
 
 # ---------------------------------------------------------------------------- setup
-def resolve_init(init: str, subfolder: Optional[str], token: Optional[str], head_layers: int):
-    """(checkpoint_dir, config) for a Laya checkpoint, or (None, fresh config) for a bare encoder."""
-    fresh = {"encoder": init, "head_layers": head_layers, "max_len": 512, "head_max_len": 192,
-             "act_costs": {"escalate": 0.5}, "amp_dtype": "bf16"}
+@dataclass
+class Base:
+    """What `load_base` hands to the training loop."""
+    tok: object
+    model: DecisionModel
+    mcfg: Dict
+    from_laya: bool
+    layout: str
+    marker_token: Optional[str]
+    marker_id: Optional[int]
+    bos_id: Optional[int]
+    note: str
+
+
+def resolve_init(init: str, subfolder: Optional[str], token: Optional[str], head_layers: Optional[int] = None):
+    """(checkpoint_dir, config) for a Laya checkpoint, or (None, fresh config) for a bare backbone."""
+    fresh = {"encoder": init, "head_layers": 2 if head_layers is None else head_layers, "max_len": 512,
+             "head_max_len": 192, "act_costs": {"escalate": 0.5}, "amp_dtype": "bf16"}
     local = os.path.join(init, subfolder) if subfolder else init
     if os.path.isdir(local):
         cfg_path = os.path.join(local, "rl_agent_config.json")
@@ -122,29 +153,58 @@ def resolve_init(init: str, subfolder: Optional[str], token: Optional[str], head
         return ckpt, json.load(f)
 
 
-def load_base(cfg: TrainConfig):
+def load_base(cfg: TrainConfig, device: torch.device) -> Base:
     from safetensors.torch import load_file
     from transformers import AutoTokenizer
 
     ckpt, mcfg = resolve_init(cfg.init, cfg.subfolder, cfg.token, cfg.head_layers)
     if ckpt:
+        if os.path.isdir(os.path.join(ckpt, ADAPTER_DIR)):
+            raise ValueError("%r is an adapter-only checkpoint; start from its base model instead" % cfg.init)
         _fix_tokenizer_config(ckpt)
         tok = AutoTokenizer.from_pretrained(os.path.join(ckpt, "tokenizer"))
         model = build_model(mcfg, encoder_dir=os.path.join(ckpt, "encoder"))
         model.load_state_dict(load_file(os.path.join(ckpt, "model.safetensors")), strict=True)
+        prev = mcfg.get("multilabel", {})
+        layout = cfg.layout or prev.get("layout", "encoder")
+        marker_token = prev.get("marker_token") if layout == "causal" else tok.mask_token
+        marker_id = tok.convert_tokens_to_ids(marker_token) if marker_token else None
+        note = "Laya checkpoint"
     else:
-        tok = AutoTokenizer.from_pretrained(cfg.init, token=cfg.token)
-        model = build_model(mcfg)
-    missing = [n for n in ("mask_token_id", "cls_token_id", "sep_token_id", "pad_token_id")
-               if getattr(tok, n, None) is None]
-    if missing:
-        raise ValueError("the tokenizer of %r lacks %s; Laya needs a masked-LM style encoder"
-                         % (cfg.init, ", ".join(missing)))
+        if cfg.load_dtype == "auto":
+            load_dtype = "bf16" if cfg.lora_r > 0 and device.type in ("cuda", "mps") else "fp32"
+        else:
+            load_dtype = cfg.load_dtype
+        enc, tcfg, layout, note = load_backbone(cfg.init, cfg.subfolder, cfg.token, load_dtype)
+        layout = cfg.layout or layout
+        tok = AutoTokenizer.from_pretrained(cfg.init, token=cfg.token,
+                                            **({"subfolder": cfg.subfolder} if cfg.subfolder else {}))
+        ensure_pad(tok)
+        if layout == "encoder":
+            missing = [n for n in ("mask_token_id", "cls_token_id", "sep_token_id") if getattr(tok, n, None) is None]
+            if missing:
+                raise ValueError("the tokenizer of %r lacks %s; use layout=causal for a decoder"
+                                 % (cfg.init, ", ".join(missing)))
+            marker_token, marker_id = tok.mask_token, tok.mask_token_id
+        else:
+            rows = enc.get_input_embeddings().num_embeddings
+            marker_token, marker_id, resize = pick_marker(tok, rows, cfg.marker_token)
+            if resize:
+                if hasattr(tcfg, "vocab_size_per_layer_input"):
+                    raise ValueError("%r has per-layer embeddings that cannot grow; pass --marker-token "
+                                     "with a token that already exists" % cfg.init)
+                enc.resize_token_embeddings(len(tok))
+        head_layers = cfg.head_layers if cfg.head_layers is not None else (2 if layout == "encoder" else 0)
+        mcfg["head_layers"] = head_layers
+        mcfg["load_dtype"] = load_dtype
+        model = DecisionModel(enc, head_layers, len(mcfg.get("act_costs", {})) + 1)
+        note = "%s, new decision head (%d layer%s)" % (note, head_layers, "" if head_layers == 1 else "s")
     try:
         model.encoder.config.reference_compile = False  # see laya.agent: keep ModernBERT eager
     except Exception:
         pass
-    return tok, model, mcfg, bool(ckpt)
+    bos_id = tok.bos_token_id if layout == "causal" else None
+    return Base(tok, model, mcfg, bool(ckpt), layout, marker_token, marker_id, bos_id, note)
 
 
 def build_schema(cfg: TrainConfig) -> LabelSchema:
@@ -186,19 +246,41 @@ def lr_factor(base_lr: float, total: int, warmup: int, eta_min: float = 1e-6):
     return f
 
 
-def save_checkpoint(model, tok, mcfg: Dict, out_dir: str, save_dtype: str):
+def save_checkpoint(model, tok, mcfg: Dict, out_dir: str, save_dtype: str, adapter: bool = False):
+    """Standard Laya layout; with `adapter`, the LoRA adapter plus the decision head instead of merged weights."""
     from safetensors.torch import save_file
 
     os.makedirs(out_dir, exist_ok=True)
-    sd = {}
-    for k, v in model.state_dict().items():
-        v = v.detach().cpu()
-        sd[k] = (v.half() if save_dtype == "fp16" and v.is_floating_point() else v).contiguous()
+    if adapter:
+        model.encoder.save_pretrained(os.path.join(out_dir, ADAPTER_DIR))
+        sd = {k: v.detach().cpu().contiguous() for k, v in head_state_dict(model).items()}
+    else:
+        sd = {}
+        for k, v in model.state_dict().items():
+            v = v.detach().cpu()
+            sd[k] = (v.half() if save_dtype == "fp16" and v.is_floating_point() else v).contiguous()
     save_file(sd, os.path.join(out_dir, "model.safetensors"))
     model.encoder.config.save_pretrained(os.path.join(out_dir, "encoder"))
     tok.save_pretrained(os.path.join(out_dir, "tokenizer"))
     with open(os.path.join(out_dir, "rl_agent_config.json"), "w") as f:
         json.dump(mcfg, f, indent=2, ensure_ascii=False)
+
+
+def load_checkpoint_weights(model, out_dir: str, adapter: bool = False):
+    """Put the weights `save_checkpoint` wrote back into the live model."""
+    from safetensors.torch import load_file
+
+    if not adapter:
+        model.load_state_dict(load_file(os.path.join(out_dir, "model.safetensors")), strict=True)
+        return
+    from peft import set_peft_model_state_dict
+
+    set_peft_model_state_dict(model.encoder, load_file(os.path.join(out_dir, ADAPTER_DIR, "adapter_model.safetensors")))
+    head = load_file(os.path.join(out_dir, "model.safetensors"))
+    missing = set(head_state_dict(model)) - set(head)
+    if missing:
+        raise ValueError("checkpoint %s lacks decision-head weights %s" % (out_dir, sorted(missing)[:3]))
+    model.load_state_dict(head, strict=False)
 
 
 def evaluate_split(model, tok, schema, examples: List[Example], budget: Budget, device, dtype,
@@ -250,24 +332,36 @@ def train(cfg: TrainConfig) -> Dict:
     y_dev = np.array([e.target for e in dev_ex], dtype=np.float32)
 
     # ---- model
-    raw_tok, model, mcfg, from_laya = load_base(cfg)
+    base = load_base(cfg, device)
+    raw_tok, model, mcfg = base.tok, base.model, base.mcfg
     tok = CachedTokenizer(raw_tok)
     max_positions = int(getattr(model.encoder.config, "max_position_embeddings", 512))
     budget = plan_budget(tok, schema, max_positions, cfg.state_budget, mcfg.get("max_len", 512),
-                         mcfg.get("head_max_len", 192), cfg.labels_per_seq)
+                         mcfg.get("head_max_len", 192), cfg.labels_per_seq, base.layout, base.marker_id, base.bos_id)
     if cfg.head_max_len:
         budget.head_max_len = cfg.head_max_len
     if cfg.max_len:
         budget.max_len = cfg.max_len
     mcfg.update(max_len=budget.max_len, head_max_len=budget.head_max_len)
+    lora = cfg.lora_r > 0
+    # written with every checkpoint, so an interrupted run still leaves something loadable
+    mcfg["multilabel"] = dict(
+        schema.to_dict(), layout=base.layout, marker_token=base.marker_token, labels_per_seq=budget.labels_per_seq,
+        base={"init": cfg.init, "subfolder": cfg.subfolder, "load_dtype": mcfg.get("load_dtype", "fp32")},
+        adapter=ADAPTER_DIR if lora else None, temperature=1.0, threshold_mode="fixed",
+        thresholds={n: 0.5 for n in schema.names})
 
+    if cfg.freeze_encoder and lora:
+        raise ValueError("freeze_encoder and lora_r are exclusive: LoRA already freezes the backbone")
     if cfg.freeze_encoder:
         model.encoder.requires_grad_(False)
     if cfg.gradient_checkpointing and not cfg.freeze_encoder:
         try:
             model.encoder.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-        except ValueError as e:  # a few encoders do not support it; training still works, with more memory
-            say("gradient checkpointing unavailable for this encoder (%s)" % e)
+        except (ValueError, AttributeError) as e:  # some backbones do not support it; training still works
+            say("gradient checkpointing unavailable for this backbone (%s)" % e)
+    if lora:
+        model.encoder = apply_lora(model.encoder, cfg.lora_r, cfg.lora_alpha, cfg.lora_dropout, cfg.lora_targets)
     model.to(device).train()
     net = model
     if distributed:
@@ -277,10 +371,14 @@ def train(cfg: TrainConfig) -> Dict:
 
     groups = [{"params": [p for n, p in model.named_parameters() if not n.startswith("encoder.")],
                "lr": cfg.lr_head}]
-    if not cfg.freeze_encoder:
+    if lora:
+        groups.insert(0, {"params": [p for n, p in model.named_parameters() if n.startswith("encoder.") and p.requires_grad],
+                          "lr": cfg.lr_lora})
+    elif not cfg.freeze_encoder:
         groups.insert(0, {"params": [p for n, p in model.named_parameters() if n.startswith("encoder.")],
                           "lr": cfg.lr_encoder})
     optimizer = torch.optim.AdamW(groups, weight_decay=cfg.weight_decay)
+    n_params, n_trainable = param_counts(model)
 
     n_chunks = -(-len(schema) // budget.labels_per_seq)
     per_rank = -(-len(train_ex) * n_chunks // world)
@@ -293,16 +391,16 @@ def train(cfg: TrainConfig) -> Dict:
     scaler = (torch.amp.GradScaler("cuda", enabled=use_scaler) if hasattr(torch.amp, "GradScaler")
               else torch.cuda.amp.GradScaler(enabled=use_scaler))  # torch < 2.3
 
-    say("init: %s%s (%s) | %.0fM params | device %s x%d | autocast %s"
-        % (cfg.init, "/" + cfg.subfolder if cfg.subfolder else "",
-           "Laya checkpoint" if from_laya else "bare encoder, new decision head",
-           sum(p.numel() for p in model.parameters()) / 1e6, device, world,
+    say("init: %s%s (%s) | %.0fM params, %.1fM trainable%s | device %s x%d | weights %s | autocast %s"
+        % (cfg.init, "/" + cfg.subfolder if cfg.subfolder else "", base.note, n_params / 1e6, n_trainable / 1e6,
+           " (LoRA r=%d)" % cfg.lora_r if lora else "", device, world, mcfg.get("load_dtype", "fp32"),
            str(dtype).replace("torch.", "") if device.type == "cuda" else "off"))
     say("data: %d train / %d dev / %d test | %d labels, %.2f per example"
         % (len(train_ex), len(dev_ex), len(test_ex), len(schema),
            float(np.mean([sum(t >= 0.5 for t in e.target) for e in train_ex]))))
-    say("sequence: max_len %d, head_max_len %d, %d labels per sequence (%d sequence%s per example)"
-        % (budget.max_len, budget.head_max_len, budget.labels_per_seq, n_chunks, "" if n_chunks == 1 else "s"))
+    say("sequence: %s layout, marker %r, max_len %d, head_max_len %d, %d labels per sequence (%d sequence%s per example)"
+        % (base.layout, base.marker_token, budget.max_len, budget.head_max_len, budget.labels_per_seq, n_chunks,
+           "" if n_chunks == 1 else "s"))
     say("schedule: %d epochs x %d micro-batches of %d, %d updates" %
         (cfg.epochs, n_batches, cfg.micro_batch, total_updates))
 
@@ -336,9 +434,18 @@ def train(cfg: TrainConfig) -> Dict:
         nonlocal best, best_epoch, stale
         if dev["micro_f1"] > best:
             best, best_epoch, stale = dev["micro_f1"], epoch, 0
-            save_checkpoint(model, raw_tok, mcfg, cfg.output_dir, cfg.save_dtype)
+            save_checkpoint(model, raw_tok, mcfg, cfg.output_dir, cfg.save_dtype, adapter=lora)
         else:
             stale += 1
+
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    peak = [0.0]
+
+    def note_memory():
+        m = peak_memory_gb(device)
+        if m is not None:
+            peak[0] = max(peak[0], m)
 
     # the starting weights are a candidate too, so the result is never worse on dev than the init
     if main and (cfg.eval_before_train or cfg.epochs == 0):
@@ -387,12 +494,14 @@ def train(cfg: TrainConfig) -> Dict:
 
             if boundary:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+                torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], cfg.max_grad_norm)
                 scaler.step(optimizer)
                 scaler.update()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 update += 1
+                if update % 10 == 1:
+                    note_memory()
 
             stats["loss"] = loss.item()
             for key in sums:
@@ -426,10 +535,9 @@ def train(cfg: TrainConfig) -> Dict:
     # ---- calibrate and evaluate the best checkpoint, exactly as it was written to disk
     report = {}
     if main:
-        from safetensors.torch import load_file
-
+        train_minutes = (time.time() - t0) / 60
         del optimizer, scaler, scheduler
-        model.load_state_dict(load_file(os.path.join(cfg.output_dir, "model.safetensors")), strict=True)
+        load_checkpoint_weights(model, cfg.output_dir, adapter=lora)
         model.eval()
         d_dev = score_states(model, tok, schema, [e.state for e in dev_ex], budget, device, dtype,
                              cfg.eval_batch_size)
@@ -440,15 +548,14 @@ def train(cfg: TrainConfig) -> Dict:
                "%.2f" % thresholds[0] if cfg.threshold_mode != "per_label"
                else "%.2f-%.2f" % (min(thresholds), max(thresholds))))
 
+        mcfg["multilabel"].update(temperature=temperature, threshold_mode=cfg.threshold_mode,
+                                  thresholds={n: t for n, t in zip(schema.names, thresholds)})
         mcfg.update({
             "fine_tuned": True,
             "model_name": "laya-multilabel",
-            "multilabel": dict(schema.to_dict(), labels_per_seq=budget.labels_per_seq,
-                               temperature=temperature, threshold_mode=cfg.threshold_mode,
-                               thresholds={n: t for n, t in zip(schema.names, thresholds)}),
             "training": {"objective": "multilabel-rlcd", "init": cfg.init, "subfolder": cfg.subfolder,
                          "best_epoch": best_epoch, "epochs_completed": epoch, "updates": update,
-                         "hours": round((time.time() - t0) / 3600, 3), "world_size": world,
+                         "hours": round(train_minutes / 60, 3), "world_size": world,
                          "config": {k: v for k, v in asdict(cfg).items() if k != "token"}},
         })
         with open(os.path.join(cfg.output_dir, "rl_agent_config.json"), "w") as f:
@@ -457,8 +564,28 @@ def train(cfg: TrainConfig) -> Dict:
         args = (budget, device, dtype, cfg.eval_batch_size, temperature, thresholds)
         report = {"best_epoch": best_epoch, "temperature": temperature,
                   "dev": evaluate_split(model, tok, schema, dev_ex, *args)}
+        timed = test_ex or dev_ex
+        t_eval = time.time()
         if test_ex:
             report["test"] = evaluate_split(model, tok, schema, test_ex, *args)
+        else:
+            timed = []
+        ms_batched = (time.time() - t_eval) * 1000 / max(1, len(timed)) if timed else None
+        single = [e.state for e in (test_ex or dev_ex)[:16]]
+        t_eval = time.time()
+        for s in single:
+            score_states(model, tok, schema, [s], budget, device, dtype, 1)
+        ms_single = (time.time() - t_eval) * 1000 / max(1, len(single))
+        # what an ablation table needs next to the accuracy numbers
+        report["run"] = {
+            "init": cfg.init + ("/" + cfg.subfolder if cfg.subfolder else ""), "layout": base.layout,
+            "lora_r": cfg.lora_r, "params_m": round(n_params / 1e6, 1), "trainable_m": round(n_trainable / 1e6, 2),
+            "weights": mcfg.get("load_dtype", "fp32"), "device": str(device), "world_size": world,
+            "updates": update, "epochs": epoch, "train_minutes": round(train_minutes, 1),
+            "peak_memory_gb": peak[0] or None,
+            "ms_per_example_batch%d" % cfg.eval_batch_size: round(ms_batched, 2) if ms_batched else None,
+            "ms_per_example_batch1": round(ms_single, 1),
+        }
         with open(os.path.join(cfg.output_dir, "metrics.json"), "w") as f:
             json.dump(report, f, indent=2, ensure_ascii=False)
         for split in ("dev", "test"):

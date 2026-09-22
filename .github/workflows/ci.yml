@@ -46,8 +46,10 @@ jobs:
           python tests/test_router.py
           python tests/test_criteria.py
 
-      - name: Multi-label pipeline (trains a tiny random encoder on CPU, no network)
-        run: python tests/test_multilabel.py
+      - name: Multi-label pipeline (trains tiny random encoder/decoder models on CPU, no network)
+        run: |
+          pip install peft
+          python tests/test_multilabel.py
 
   lint:
     name: lint

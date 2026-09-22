@@ -1,0 +1,8 @@
+[
+  {"name": "laya_en_rlcd", "overrides": {}},
+  {"name": "laya_en_bce", "overrides": {"rl_weight": 0}},
+  {"name": "modernbert_large_bare", "overrides": {"init": "answerdotai/ModernBERT-large", "lr_head": 5e-4, "warmup_ratio": 0.05}},
+  {"name": "qwen3_0.6b_lora", "overrides": {"init": "Qwen/Qwen3-0.6B-Base", "lora_r": 16}},
+  {"name": "qwen3.5_0.8b_lora", "overrides": {"init": "Qwen/Qwen3.5-0.8B-Base", "lora_r": 16}},
+  {"name": "gemma4_e2b_lora", "overrides": {"init": "google/gemma-4-E2B", "lora_r": 16, "micro_batch": 4, "grad_accum": 8}}
+]

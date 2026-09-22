@@ -22,8 +22,9 @@ import torch  # noqa: E402
 import laya  # noqa: E402
 from laya.common import QTYPES, proper_reward  # noqa: E402
 from laya.multilabel import (  # noqa: E402
-    LabelSchema, MultiLabelAgent, TrainConfig, build_items, fit_temperature, multilabel_metrics,
-    multilabel_pairs, multilabel_rlcd_loss, plan_budget, read_jsonl, rlcd_loss, train, tune_thresholds,
+    LabelSchema, MultiLabelAgent, TrainConfig, build_causal_sequence, build_items, detect_layout, fit_temperature,
+    multilabel_metrics, multilabel_pairs, multilabel_rlcd_loss, pick_marker, plan_budget, read_jsonl, rlcd_loss,
+    train, tune_thresholds,
 )
 from laya.multilabel.__main__ import main as cli  # noqa: E402
 from laya.multilabel.data import chunk_labels  # noqa: E402
@@ -284,6 +285,147 @@ try:
     ok("agent/refuses a directory that is not a checkpoint", False)
 except (FileNotFoundError, ValueError):
     ok("agent/refuses a directory that is not a checkpoint", True)
+
+# ---------------------------------------------------------------- 6. decoders: causal layout
+head("6. Decoder backbone: causal layout, full fine-tune and LoRA adapter (tiny random Qwen3, CPU)")
+
+
+def make_decoder(root):
+    """Same WordPiece vocab, but a decoder-style tokenizer (no mask/cls/sep) and a tiny Qwen3."""
+    from transformers import PreTrainedTokenizerFast, Qwen3Config, Qwen3Model
+
+    dtok = PreTrainedTokenizerFast(tokenizer_object=tok.backend_tokenizer, pad_token="[PAD]", unk_token="[UNK]")
+    dtok.model_max_length = 512
+    dec = os.path.join(root, "decoder")
+    dtok.save_pretrained(dec)
+    torch.manual_seed(0)
+    Qwen3Model(Qwen3Config(vocab_size=len(dtok), hidden_size=64, num_hidden_layers=2, num_attention_heads=4,
+                           num_key_value_heads=2, intermediate_size=128, max_position_embeddings=512,
+                           tie_word_embeddings=False)).save_pretrained(dec)
+    return dtok, dec
+
+
+dtok, DEC = make_decoder(tmp.name)
+from transformers import AutoConfig  # noqa: E402
+
+ok("layout/decoder config is detected as causal", detect_layout(AutoConfig.from_pretrained(DEC)) == "causal")
+ok("layout/encoder config is detected as encoder", detect_layout(AutoConfig.from_pretrained(ENC)) == "encoder")
+marker, marker_id, resize = pick_marker(dtok, len(dtok))
+ok("marker/no mask token -> <opt> is added and needs a new embedding row", marker == "<opt>" and resize
+   and marker_id == len(dtok) - 1)
+ok("marker/a mask token is used when the tokenizer has one", pick_marker(tok, 10 ** 6)[0] == tok.mask_token)
+cb = plan_budget(dtok, schema, 512, 64, layout="causal", marker_id=marker_id, bos_id=None)
+ok("causal/budget adds the parts up", cb.layout == "causal" and cb.max_len == cb.head_max_len + 4 + 64)
+state = {"utterance": "play jazz"}
+ids, mk = build_causal_sequence(dtok, state, schema.question([1, 0]), cb.max_len, marker_id)
+state_ids = dtok(json.dumps(state, ensure_ascii=False), add_special_tokens=False)["input_ids"]
+ok("causal/one marker per option, each on the marker token", len(mk) == 3 and all(ids[m] == marker_id for m in mk))
+ok("causal/state comes first", ids[:len(state_ids)] == state_ids)
+segs = [dtok.decode(ids[(mk[i - 1] + 1) if i else len(state_ids):mk[i]]) for i in range(3)]
+ok("causal/threshold option precedes the labels", "none" in segs[0] and "question" in segs[0])
+ok("causal/each marker follows its own option text", "book" in segs[1] and "play" in segs[2], segs)
+ok("causal/markers are increasing", mk == sorted(mk) and mk[-1] == len(ids) - 1)
+short = build_causal_sequence(dtok, {"utterance": "play jazz " * 200}, schema.question(), 96, marker_id)
+ok("causal/long state is truncated, options kept", len(short[0]) <= 96 and len(short[1]) == len(schema) + 1)
+bos_ids, bos_mk = build_causal_sequence(dtok, state, schema.question([1, 0]), cb.max_len, marker_id, bos_id=7)
+ok("causal/bos goes first when the tokenizer has one", bos_ids[0] == 7 and bos_ids[1:] == ids
+   and bos_mk == [m + 1 for m in mk])
+
+OUT_D = os.path.join(tmp.name, "out_dec")
+cfg_d = TrainConfig(train_file=DATA, dev_file=DATA, labels_file=LABELS_FILE, init=DEC, output_dir=OUT_D,
+                    device="cpu", epochs=40, micro_batch=8, grad_accum=1, lr_encoder=1e-3, lr_head=1e-3,
+                    shuffle_labels=False, rl_weight=0.3, log_every=10 ** 6)
+rep_d = train(cfg_d)
+saved_d = json.load(open(os.path.join(OUT_D, "rl_agent_config.json")))
+ok("decoder/causal layout and marker recorded", saved_d["multilabel"]["layout"] == "causal"
+   and saved_d["multilabel"]["marker_token"] == "<opt>" and saved_d["head_layers"] == 0)
+ok("decoder/full fine-tune memorises the set", rep_d["dev"]["micro_f1"] > 0.9, rep_d["dev"]["micro_f1"])
+ok("decoder/run stats recorded", rep_d["run"]["layout"] == "causal" and rep_d["run"]["trainable_m"] > 0
+   and rep_d["run"]["ms_per_example_batch1"] > 0)
+ag_d = MultiLabelAgent(OUT_D, device="cpu")
+p_d = ag_d.probabilities(states)
+m_d = multilabel_metrics(p_d, y, ag_d.thresholds, ag_d.schema.names)
+ok("decoder/full checkpoint reloads through laya.Agent with identical metrics",
+   ag_d.agent is not None and abs(m_d["micro_f1"] - rep_d["dev"]["micro_f1"]) < 1e-6)
+ok("decoder/tokenizer on disk carries the marker", ag_d.tok.convert_tokens_to_ids("<opt>") == marker_id)
+
+try:
+    import peft  # noqa: F401
+    HAVE_PEFT = True
+except ImportError:
+    HAVE_PEFT = False
+if HAVE_PEFT:
+    OUT_L = os.path.join(tmp.name, "out_lora")
+    cfg_l = TrainConfig(train_file=DATA, dev_file=DATA, labels_file=LABELS_FILE, init=DEC, output_dir=OUT_L,
+                        device="cpu", epochs=30, micro_batch=8, grad_accum=1, lora_r=8, lr_lora=5e-3, lr_head=1e-3,
+                        shuffle_labels=False, rl_weight=0.3, log_every=10 ** 6)
+    rep_l = train(cfg_l)
+    ok("lora/adapter-only checkpoint layout", os.path.exists(os.path.join(OUT_L, "adapter", "adapter_model.safetensors"))
+       and os.path.exists(os.path.join(OUT_L, "model.safetensors")))
+    head_only = os.path.getsize(os.path.join(OUT_L, "model.safetensors")) < os.path.getsize(os.path.join(OUT_D, "model.safetensors"))
+    ok("lora/model.safetensors holds only the decision head", head_only)
+    ok("lora/learns", rep_l["dev"]["micro_f1"] > 0.6, rep_l["dev"]["micro_f1"])
+    ok("lora/trainable parameters are the adapter and the head", 0 < rep_l["run"]["trainable_m"] < rep_d["run"]["trainable_m"])
+    ag_l = MultiLabelAgent(OUT_L, device="cpu")
+    m_l = multilabel_metrics(ag_l.probabilities(states), y, ag_l.thresholds, ag_l.schema.names)
+    ok("lora/base + adapter reload gives identical metrics", ag_l.agent is None
+       and abs(m_l["micro_f1"] - rep_l["dev"]["micro_f1"]) < 1e-6, (m_l["micro_f1"], rep_l["dev"]["micro_f1"]))
+    try:
+        train(TrainConfig(train_file=DATA, init=OUT_L, output_dir=os.path.join(tmp.name, "x"), device="cpu", epochs=0))
+        ok("lora/adapter checkpoint is refused as an init", False)
+    except ValueError:
+        ok("lora/adapter checkpoint is refused as an init", True)
+else:
+    print("   SKIP lora/* (peft not installed)")
+
+# ---------------------------------------------------------------- 7. Gemma 4 architecture
+head("7. Gemma 4 text backbone: per-layer embeddings, <mask> reused as marker (tiny random model, CPU)")
+try:
+    from transformers import PreTrainedTokenizerFast
+    from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
+    HAVE_GEMMA4 = True
+except ImportError:
+    HAVE_GEMMA4 = False
+if HAVE_GEMMA4:
+    from transformers import AutoModel
+
+    gtok = PreTrainedTokenizerFast(tokenizer_object=tok.backend_tokenizer, pad_token="[PAD]", unk_token="[UNK]",
+                                   mask_token="[MASK]", bos_token="[CLS]", eos_token="[SEP]")
+    gtok.model_max_length = 512
+    G4 = os.path.join(tmp.name, "gemma4")
+    gtok.save_pretrained(G4)
+    # the last layer shares KV with the last non-shared layer of its type, so it needs one before it
+    gcfg = Gemma4TextConfig(vocab_size=len(gtok), hidden_size=64, intermediate_size=128, num_hidden_layers=4,
+                            num_attention_heads=4, num_key_value_heads=1, head_dim=16, max_position_embeddings=512,
+                            sliding_window=32, num_kv_shared_layers=1,
+                            layer_types=["sliding_attention", "full_attention", "sliding_attention", "full_attention"],
+                            vocab_size_per_layer_input=len(gtok), hidden_size_per_layer_input=8,
+                            pad_token_id=gtok.pad_token_id, bos_token_id=gtok.bos_token_id, eos_token_id=gtok.eos_token_id)
+    torch.manual_seed(0)
+    AutoModel.from_config(gcfg).save_pretrained(G4)
+    ok("gemma4/decoder although the tokenizer has a mask token", detect_layout(AutoConfig.from_pretrained(G4)) == "causal")
+    ok("gemma4/the mask token is reused as marker, no resize", pick_marker(gtok, len(gtok)) == ("[MASK]", gtok.mask_token_id, False))
+    OUT_G = os.path.join(tmp.name, "out_g4")
+    rep_g = train(TrainConfig(train_file=DATA, dev_file=DATA, labels_file=LABELS_FILE, init=G4, output_dir=OUT_G,
+                              device="cpu", epochs=30, micro_batch=8, grad_accum=1, lr_encoder=1e-3, lr_head=1e-3,
+                              shuffle_labels=False, rl_weight=0.3, log_every=10 ** 6))
+    saved_g = json.load(open(os.path.join(OUT_G, "rl_agent_config.json")))
+    ok("gemma4/trains with bos first and <mask> markers", rep_g["dev"]["micro_f1"] > 0.8
+       and saved_g["multilabel"]["marker_token"] == "[MASK]", rep_g["dev"]["micro_f1"])
+    ag_g = MultiLabelAgent(OUT_G, device="cpu")
+    ok("gemma4/reloads with identical metrics",
+       abs(multilabel_metrics(ag_g.probabilities(states), y, ag_g.thresholds, ag_g.schema.names)["micro_f1"]
+           - rep_g["dev"]["micro_f1"]) < 1e-6)
+    ok("gemma4/bos is the first token of every sequence",
+       build_items(ag_g.tok, ag_g.schema, "x", ag_g.budget)[0]["ids"][0] == gtok.bos_token_id)
+    try:
+        train(TrainConfig(train_file=DATA, dev_file=DATA, labels_file=LABELS_FILE, init=G4, marker_token="<opt>",
+                          output_dir=os.path.join(tmp.name, "x2"), device="cpu", epochs=0))
+        ok("gemma4/refuses a marker that would need a new embedding row", False)
+    except ValueError:
+        ok("gemma4/refuses a marker that would need a new embedding row", True)
+else:
+    print("   SKIP gemma4/* (this transformers has no gemma4)")
 
 # ---------------------------------------------------------------- summary
 head("SUMMARY")
