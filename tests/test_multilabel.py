@@ -22,8 +22,9 @@ import torch  # noqa: E402
 import laya  # noqa: E402
 from laya.common import QTYPES, proper_reward  # noqa: E402
 from laya.multilabel import (  # noqa: E402
-    LabelSchema, MultiLabelAgent, TrainConfig, build_items, fit_temperature, multilabel_metrics,
-    multilabel_pairs, multilabel_rlcd_loss, plan_budget, read_jsonl, rlcd_loss, train, tune_thresholds,
+    LabelSchema, MultiLabelAgent, TrainConfig, build_causal_sequence, build_items, detect_layout, fit_temperature,
+    multilabel_metrics, multilabel_pairs, multilabel_rlcd_loss, pick_marker, plan_budget, read_jsonl, rlcd_loss,
+    train, tune_thresholds,
 )
 from laya.multilabel.__main__ import main as cli  # noqa: E402
 from laya.multilabel.data import chunk_labels  # noqa: E402
@@ -284,6 +285,232 @@ try:
     ok("agent/refuses a directory that is not a checkpoint", False)
 except (FileNotFoundError, ValueError):
     ok("agent/refuses a directory that is not a checkpoint", True)
+
+# ---------------------------------------------------------------- 6. decoders: causal layout
+head("6. Decoder backbone: causal layout, full fine-tune and LoRA adapter (tiny random Qwen3, CPU)")
+
+
+def make_decoder(root):
+    """Same WordPiece vocab, but a decoder-style tokenizer (no mask/cls/sep) and a tiny Qwen3."""
+    from transformers import PreTrainedTokenizerFast, Qwen3Config, Qwen3Model
+
+    dtok = PreTrainedTokenizerFast(tokenizer_object=tok.backend_tokenizer, pad_token="[PAD]", unk_token="[UNK]")
+    dtok.model_max_length = 512
+    dec = os.path.join(root, "decoder")
+    dtok.save_pretrained(dec)
+    torch.manual_seed(0)
+    Qwen3Model(Qwen3Config(vocab_size=len(dtok), hidden_size=64, num_hidden_layers=2, num_attention_heads=4,
+                           num_key_value_heads=2, intermediate_size=128, max_position_embeddings=512,
+                           tie_word_embeddings=False)).save_pretrained(dec)
+    return dtok, dec
+
+
+dtok, DEC = make_decoder(tmp.name)
+from transformers import AutoConfig  # noqa: E402
+
+ok("layout/decoder config is detected as causal", detect_layout(AutoConfig.from_pretrained(DEC)) == "causal")
+ok("layout/encoder config is detected as encoder", detect_layout(AutoConfig.from_pretrained(ENC)) == "encoder")
+marker, marker_id, resize = pick_marker(dtok, len(dtok))
+ok("marker/no mask token -> <opt> is added and needs a new embedding row", marker == "<opt>" and resize
+   and marker_id == len(dtok) - 1)
+ok("marker/a mask token is used when the tokenizer has one", pick_marker(tok, 10 ** 6)[0] == tok.mask_token)
+cb = plan_budget(dtok, schema, 512, 64, layout="causal", marker_id=marker_id, bos_id=None)
+ok("causal/budget adds the parts up", cb.layout == "causal" and cb.max_len == cb.head_max_len + 4 + 64)
+state = {"utterance": "play jazz"}
+ids, mk = build_causal_sequence(dtok, state, schema.question([1, 0]), cb.max_len, marker_id)
+state_ids = dtok(json.dumps(state, ensure_ascii=False), add_special_tokens=False)["input_ids"]
+ok("causal/one marker per option, each on the marker token", len(mk) == 3 and all(ids[m] == marker_id for m in mk))
+ok("causal/state comes first", ids[:len(state_ids)] == state_ids)
+segs = [dtok.decode(ids[(mk[i - 1] + 1) if i else len(state_ids):mk[i]]) for i in range(3)]
+ok("causal/threshold option precedes the labels", "none" in segs[0] and "question" in segs[0])
+ok("causal/each marker follows its own option text", "book" in segs[1] and "play" in segs[2], segs)
+ok("causal/markers are increasing", mk == sorted(mk) and mk[-1] == len(ids) - 1)
+short = build_causal_sequence(dtok, {"utterance": "play jazz " * 200}, schema.question(), 96, marker_id)
+ok("causal/long state is truncated, options kept", len(short[0]) <= 96 and len(short[1]) == len(schema) + 1)
+bos_ids, bos_mk = build_causal_sequence(dtok, state, schema.question([1, 0]), cb.max_len, marker_id, bos_id=7)
+ok("causal/bos goes first when the tokenizer has one", bos_ids[0] == 7 and bos_ids[1:] == ids
+   and bos_mk == [m + 1 for m in mk])
+
+OUT_D = os.path.join(tmp.name, "out_dec")
+cfg_d = TrainConfig(train_file=DATA, dev_file=DATA, labels_file=LABELS_FILE, init=DEC, output_dir=OUT_D,
+                    device="cpu", epochs=40, micro_batch=8, grad_accum=1, lr_encoder=1e-3, lr_head=1e-3,
+                    shuffle_labels=False, rl_weight=0.3, log_every=10 ** 6)
+rep_d = train(cfg_d)
+saved_d = json.load(open(os.path.join(OUT_D, "rl_agent_config.json")))
+ok("decoder/causal layout and marker recorded", saved_d["multilabel"]["layout"] == "causal"
+   and saved_d["multilabel"]["marker_token"] == "<opt>" and saved_d["head_layers"] == 0)
+ok("decoder/full fine-tune memorises the set", rep_d["dev"]["micro_f1"] > 0.9, rep_d["dev"]["micro_f1"])
+ok("decoder/run stats recorded", rep_d["run"]["layout"] == "causal" and rep_d["run"]["trainable_m"] > 0
+   and rep_d["run"]["ms_per_example_batch1"] > 0)
+ag_d = MultiLabelAgent(OUT_D, device="cpu")
+p_d = ag_d.probabilities(states)
+m_d = multilabel_metrics(p_d, y, ag_d.thresholds, ag_d.schema.names)
+ok("decoder/full checkpoint reloads through laya.Agent with identical metrics",
+   ag_d.agent is not None and abs(m_d["micro_f1"] - rep_d["dev"]["micro_f1"]) < 1e-6)
+ok("decoder/tokenizer on disk carries the marker", ag_d.tok.convert_tokens_to_ids("<opt>") == marker_id)
+
+try:
+    import peft  # noqa: F401
+    HAVE_PEFT = True
+except ImportError:
+    HAVE_PEFT = False
+if HAVE_PEFT:
+    OUT_L = os.path.join(tmp.name, "out_lora")
+    cfg_l = TrainConfig(train_file=DATA, dev_file=DATA, labels_file=LABELS_FILE, init=DEC, output_dir=OUT_L,
+                        device="cpu", epochs=30, micro_batch=8, grad_accum=1, lora_r=8, lr_lora=5e-3, lr_head=1e-3,
+                        shuffle_labels=False, rl_weight=0.3, log_every=10 ** 6)
+    rep_l = train(cfg_l)
+    ok("lora/adapter-only checkpoint layout", os.path.exists(os.path.join(OUT_L, "adapter", "adapter_model.safetensors"))
+       and os.path.exists(os.path.join(OUT_L, "model.safetensors")))
+    head_only = os.path.getsize(os.path.join(OUT_L, "model.safetensors")) < os.path.getsize(os.path.join(OUT_D, "model.safetensors"))
+    ok("lora/model.safetensors holds only the decision head", head_only)
+    ok("lora/learns", rep_l["dev"]["micro_f1"] > 0.6, rep_l["dev"]["micro_f1"])
+    ok("lora/trainable parameters are the adapter and the head", 0 < rep_l["run"]["trainable_m"] < rep_d["run"]["trainable_m"])
+    ag_l = MultiLabelAgent(OUT_L, device="cpu")
+    m_l = multilabel_metrics(ag_l.probabilities(states), y, ag_l.thresholds, ag_l.schema.names)
+    ok("lora/base + adapter reload gives identical metrics", ag_l.agent is None
+       and abs(m_l["micro_f1"] - rep_l["dev"]["micro_f1"]) < 1e-6, (m_l["micro_f1"], rep_l["dev"]["micro_f1"]))
+    try:
+        train(TrainConfig(train_file=DATA, init=OUT_L, output_dir=os.path.join(tmp.name, "x"), device="cpu", epochs=0))
+        ok("lora/adapter checkpoint is refused as an init", False)
+    except ValueError:
+        ok("lora/adapter checkpoint is refused as an init", True)
+else:
+    print("   SKIP lora/* (peft not installed)")
+
+# ---------------------------------------------------------------- 7. Gemma 4 architecture
+head("7. Gemma 4 text backbone: per-layer embeddings, <mask> reused as marker (tiny random model, CPU)")
+try:
+    from transformers import PreTrainedTokenizerFast
+    from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
+    HAVE_GEMMA4 = True
+except ImportError:
+    HAVE_GEMMA4 = False
+if HAVE_GEMMA4:
+    from transformers import AutoModel
+
+    gtok = PreTrainedTokenizerFast(tokenizer_object=tok.backend_tokenizer, pad_token="[PAD]", unk_token="[UNK]",
+                                   mask_token="[MASK]", bos_token="[CLS]", eos_token="[SEP]")
+    gtok.model_max_length = 512
+    G4 = os.path.join(tmp.name, "gemma4")
+    gtok.save_pretrained(G4)
+    # the last layer shares KV with the last non-shared layer of its type, so it needs one before it
+    gcfg = Gemma4TextConfig(vocab_size=len(gtok), hidden_size=64, intermediate_size=128, num_hidden_layers=4,
+                            num_attention_heads=4, num_key_value_heads=1, head_dim=16, max_position_embeddings=512,
+                            sliding_window=32, num_kv_shared_layers=1,
+                            layer_types=["sliding_attention", "full_attention", "sliding_attention", "full_attention"],
+                            vocab_size_per_layer_input=len(gtok), hidden_size_per_layer_input=8,
+                            pad_token_id=gtok.pad_token_id, bos_token_id=gtok.bos_token_id, eos_token_id=gtok.eos_token_id)
+    torch.manual_seed(0)
+    AutoModel.from_config(gcfg).save_pretrained(G4)
+    ok("gemma4/decoder although the tokenizer has a mask token", detect_layout(AutoConfig.from_pretrained(G4)) == "causal")
+    ok("gemma4/the mask token is reused as marker, no resize", pick_marker(gtok, len(gtok)) == ("[MASK]", gtok.mask_token_id, False))
+    OUT_G = os.path.join(tmp.name, "out_g4")
+    rep_g = train(TrainConfig(train_file=DATA, dev_file=DATA, labels_file=LABELS_FILE, init=G4, output_dir=OUT_G,
+                              device="cpu", epochs=30, micro_batch=8, grad_accum=1, lr_encoder=1e-3, lr_head=1e-3,
+                              shuffle_labels=False, rl_weight=0.3, log_every=10 ** 6))
+    saved_g = json.load(open(os.path.join(OUT_G, "rl_agent_config.json")))
+    ok("gemma4/trains with bos first and <mask> markers", rep_g["dev"]["micro_f1"] > 0.8
+       and saved_g["multilabel"]["marker_token"] == "[MASK]", rep_g["dev"]["micro_f1"])
+    ag_g = MultiLabelAgent(OUT_G, device="cpu")
+    ok("gemma4/reloads with identical metrics",
+       abs(multilabel_metrics(ag_g.probabilities(states), y, ag_g.thresholds, ag_g.schema.names)["micro_f1"]
+           - rep_g["dev"]["micro_f1"]) < 1e-6)
+    ok("gemma4/bos is the first token of every sequence",
+       build_items(ag_g.tok, ag_g.schema, "x", ag_g.budget)[0]["ids"][0] == gtok.bos_token_id)
+    try:
+        train(TrainConfig(train_file=DATA, dev_file=DATA, labels_file=LABELS_FILE, init=G4, marker_token="<opt>",
+                          output_dir=os.path.join(tmp.name, "x2"), device="cpu", epochs=0))
+        ok("gemma4/refuses a marker that would need a new embedding row", False)
+    except ValueError:
+        ok("gemma4/refuses a marker that would need a new embedding row", True)
+else:
+    print("   SKIP gemma4/* (this transformers has no gemma4)")
+
+# ---------------------------------------------------------------- 8. experiment tracking
+head("8. Experiment tracking (trackio when installed; the adapter itself needs nothing)")
+from laya.multilabel.tracking import Tracker, flat  # noqa: E402
+
+ok("tracking/flat nests with slashes and drops non-numbers",
+   flat("dev", {"micro_f1": 0.5, "per_label": {"a": {"f1": 1.0}}, "name": "x", "ok": True})
+   == {"dev/micro_f1": 0.5, "dev/per_label/a/f1": 1.0})
+none = Tracker("none", "p", "r", {})
+none.log({"x": 1}, step=0)
+none.finish()
+ok("tracking/none is a no-op", none.url is None)
+try:
+    Tracker("mlflow", "p", "r", {})
+    ok("tracking/unknown tracker is rejected", False)
+except ValueError:
+    ok("tracking/unknown tracker is rejected", True)
+os.environ["TRACKIO_DIR"] = os.path.join(tmp.name, "trackio")  # must be set before trackio is first imported
+try:
+    import trackio  # noqa: F401
+    HAVE_TRACKIO = True
+except ImportError:
+    HAVE_TRACKIO = False
+if HAVE_TRACKIO:
+    import sqlite3
+
+    rep_t = train(TrainConfig(train_file=DATA, dev_file=DATA, labels_file=LABELS_FILE, init=DEC,
+                              output_dir=os.path.join(tmp.name, "out_trk"), device="cpu", epochs=3, micro_batch=8,
+                              grad_accum=1, lr_encoder=1e-3, lr_head=1e-3, log_every=2, tracker="trackio",
+                              project="laya-test", run_name="tiny"))
+    db = os.path.join(tmp.name, "trackio", "laya-test.db")
+    con = sqlite3.connect(db)
+    n_rows = con.execute("select count(*) from metrics where run_name = 'tiny'").fetchone()[0]
+    last = json.loads(con.execute("select metrics from metrics where run_name = 'tiny' order by step desc, id desc limit 1")
+                      .fetchone()[0])
+    cfg_row = json.loads(con.execute("select config from configs where run_name = 'tiny'").fetchone()[0])
+    con.close()
+    ok("tracking/trackio has per-step and per-epoch rows", n_rows >= 3 + 3, n_rows)
+    ok("tracking/final metrics match metrics.json", abs(last["final/test/micro_f1"] - rep_t["test"]["micro_f1"]) < 1e-9
+       if "final/test/micro_f1" in last else abs(last["final/dev/micro_f1"] - rep_t["dev"]["micro_f1"]) < 1e-9, last)
+    ok("tracking/config is recorded", cfg_row.get("lr_head") == 1e-3 and cfg_row.get("layout") == "causal")
+else:
+    print("   SKIP tracking/trackio (not installed)")
+
+# ---------------------------------------------------------------- 9. RoBERTa-style position offset
+head("9. RoBERTa-family backbone: position ids start at padding_idx + 1 (tiny random XLM-R, CPU)")
+from transformers import AutoModel, XLMRobertaConfig, XLMRobertaModel  # noqa: E402
+
+from laya.multilabel.backbone import usable_positions  # noqa: E402
+
+XR = os.path.join(tmp.name, "xlmr")
+tok.save_pretrained(XR)
+torch.manual_seed(0)
+N_POS = 98
+XLMRobertaModel(XLMRobertaConfig(vocab_size=len(tok), hidden_size=64, num_hidden_layers=2, num_attention_heads=2,
+                                 intermediate_size=128, max_position_embeddings=N_POS,
+                                 pad_token_id=tok.pad_token_id)).save_pretrained(XR)
+xr = AutoModel.from_pretrained(XR)
+usable = N_POS - tok.pad_token_id - 1
+ok("xlmr/usable positions exclude the padding offset", usable_positions(xr) == usable, usable_positions(xr))
+ok("xlmr/other backbones are untouched", usable_positions(AutoModel.from_pretrained(ENC)) == 256
+   and usable_positions(AutoModel.from_pretrained(DEC)) == 512)
+with torch.no_grad():
+    xr(input_ids=torch.randint(5, len(tok), (1, usable)))
+    try:
+        xr(input_ids=torch.randint(5, len(tok), (1, usable + 1)))
+        ok("xlmr/one token past the usable length really fails", False)
+    except (IndexError, RuntimeError):
+        ok("xlmr/one token past the usable length really fails", True)
+
+# states far longer than the budget: every sequence is cut to exactly max_len, so max_len must be addressable
+LONG = os.path.join(tmp.name, "long.jsonl")
+with open(LONG, "w") as f:
+    for r in (json.loads(line) for line in open(DATA)):
+        f.write(json.dumps({"text": (r["text"] + " ") * 40, "labels": r["labels"]}) + "\n")
+OUT_X = os.path.join(tmp.name, "out_xlmr")
+try:
+    train(TrainConfig(train_file=LONG, dev_file=LONG, labels_file=LABELS_FILE, init=XR, output_dir=OUT_X, device="cpu",
+                      epochs=1, micro_batch=8, grad_accum=1, state_budget=40, log_every=10 ** 6, eval_before_train=False))
+    saved_x = json.load(open(os.path.join(OUT_X, "rl_agent_config.json")))
+    ok("xlmr/sequences are budgeted within the usable positions", saved_x["max_len"] == usable, saved_x["max_len"])
+    ag_x = MultiLabelAgent(OUT_X, device="cpu")
+    ok("xlmr/inference on long states works from disk", ag_x.probabilities([("play jazz " * 80)]).shape == (1, 4))
+except (IndexError, RuntimeError) as e:
+    ok("xlmr/training with truncated long states does not overflow the position table", False, e)
 
 # ---------------------------------------------------------------- summary
 head("SUMMARY")

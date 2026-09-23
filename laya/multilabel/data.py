@@ -1,14 +1,28 @@
-"""Multi-label examples, token budgets, and sequence items built on `laya.common.build_sequence`."""
+"""Multi-label examples, token budgets, and sequence items.
+
+Two sequence layouts, chosen by the backbone:
+
+  encoder   Laya's own, from `laya.common.build_sequence`:
+            [CLS] choice question: <ins> [SEP] [MASK] none: .. [MASK] label: .. [SEP] state [SEP]
+            The marker precedes its option and reads it through bidirectional attention.
+  causal    for decoders, where a position only sees what came before it:
+            <bos>? state \\n choice question: <ins> \\n - none: .. <m> \\n - label: .. <m>
+            The state comes first and the marker <m> follows its option, so by the time the
+            backbone reaches a marker it has read the state, the question and that option.
+
+In both, marker 0 is the threshold option and markers 1.. are the labels of the sequence.
+"""
 import json
 import random
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Dict, Iterable, List, Optional, Sequence, Union
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
-from ..common import QTYPES, build_sequence, render_options
+from ..common import QTYPES, build_sequence, render_options, serialize_state
 from .schema import LabelSchema
 
 OPTION_TOKEN_CAP = 48  # build_sequence keeps at most this many tokens of each option text
+LAYOUTS = ("encoder", "causal")
 
 
 @dataclass
@@ -21,8 +35,39 @@ class Example:
 @dataclass
 class Budget:
     max_len: int
-    head_max_len: int
+    head_max_len: int          # encoder layout: the option budget of build_sequence; causal: informational
     labels_per_seq: int
+    layout: str = "encoder"
+    marker_id: Optional[int] = None  # causal layout only
+    bos_id: Optional[int] = None     # causal layout only; None when the tokenizer has no bos
+
+
+def build_causal_sequence(
+    tok,
+    state: Union[str, dict, list],
+    q: Dict,
+    max_len: int,
+    marker_id: int,
+    bos_id: Optional[int] = None,
+    option_order: Optional[List[int]] = None,
+) -> Tuple[List[int], List[int]]:
+    """Causal layout; same contract as `laya.common.build_sequence` (ids, marker positions)."""
+    opts = render_options(q)
+    order = option_order if option_order is not None else list(range(len(opts)))
+    head_ids = tok("\nchoice question: %s" % q["ins"], add_special_tokens=False)["input_ids"]
+    opt_ids = [tok("\n- " + opts[i], add_special_tokens=False)["input_ids"][:OPTION_TOKEN_CAP] + [marker_id]
+               for i in order]
+    prefix = [bos_id] if bos_id is not None else []
+    room = max_len - len(prefix) - len(head_ids) - sum(len(o) for o in opt_ids)
+    if room < 8:
+        raise ValueError("max_len=%d leaves no room for the state next to %d options" % (max_len, len(opts)))
+    st = tok(serialize_state(state), add_special_tokens=False)["input_ids"][:room]
+    ids = prefix + st + head_ids
+    markers = []
+    for o in opt_ids:
+        ids.extend(o)
+        markers.append(len(ids) - 1)
+    return ids, markers
 
 
 class CachedTokenizer:
@@ -106,22 +151,37 @@ def plan_budget(
     base_max_len: int = 512,
     base_head_max_len: int = 192,
     labels_per_seq: Optional[int] = None,
+    layout: str = "encoder",
+    marker_id: Optional[int] = None,
+    bos_id: Optional[int] = None,
 ) -> Budget:
-    """Size `head_max_len` / `max_len` so no option is truncated, chunking labels if they cannot fit.
+    """Size the sequence so no option is truncated, chunking labels if they cannot fit.
 
     Options share `head_max_len`; when they overflow it `build_sequence` cuts every option down to
     a few tokens and labels become indistinguishable (the Banking77 failure in the README). Each
     label is decided against the threshold option of its own sequence, so unlike a softmax `choice`
     the label set can be split across sequences without changing what a probability means.
+
+    The causal layout has no option budget of its own; `max_len` is simply what the parts add up
+    to, capped by the backbone's positions (decoders have tens of thousands, so chunking there is
+    a memory choice made with `labels_per_seq`, not a necessity).
     """
+    if layout not in LAYOUTS:
+        raise ValueError("layout must be one of %s, got %r" % (LAYOUTS, layout))
     opts = render_options(schema.question())
-    lens = [1 + min(OPTION_TOKEN_CAP, _ntok(tok, " " + o)) for o in opts]
+    if layout == "causal":
+        if marker_id is None:
+            raise ValueError("the causal layout needs a marker_id")
+        lens = [1 + min(OPTION_TOKEN_CAP, _ntok(tok, "\n- " + o)) for o in opts]
+        fixed = (1 if bos_id is not None else 0) + _ntok(tok, "\nchoice question: " + schema.instructions)
+    else:
+        lens = [1 + min(OPTION_TOKEN_CAP, _ntok(tok, " " + o)) for o in opts]
+        # build_sequence starts truncating once fewer than 16 tokens are left for the instructions
+        fixed = max(16, _ntok(tok, "choice question: " + schema.instructions))
     none_len, lab_lens = lens[0], sorted(lens[1:], reverse=True)
-    ins_len = _ntok(tok, "choice question: " + schema.instructions)
 
     def head_need(c: int) -> int:
-        # build_sequence starts truncating once fewer than 16 tokens are left for the instructions
-        return none_len + sum(lab_lens[:c]) + max(16, ins_len)
+        return none_len + sum(lab_lens[:c]) + fixed
 
     c = len(lab_lens) if labels_per_seq is None else max(1, min(labels_per_seq, len(lab_lens)))
     while c > 1 and head_need(c) + 4 + state_budget > max_positions:
@@ -131,6 +191,10 @@ def plan_budget(
             "one label plus %d state tokens does not fit in %d positions; shorten the label "
             "descriptions or lower state_budget" % (state_budget, max_positions)
         )
+    if layout == "causal":
+        head = head_need(c)
+        return Budget(max_len=min(max_positions, head + 4 + state_budget), head_max_len=head, labels_per_seq=c,
+                      layout=layout, marker_id=marker_id, bos_id=bos_id)
     head = max(base_head_max_len, -(-head_need(c) // 8) * 8)
     head = min(head, max_positions - 4 - state_budget)
     max_len = min(max_positions, max(base_max_len, head + 4 + state_budget))
@@ -159,9 +223,14 @@ def build_items(
     """Sequences for one example. Marker 0 is the threshold option, markers 1.. are `label_idx`."""
     items = []
     for chunk in chunk_labels(len(schema), budget.labels_per_seq, rng):
-        ids, markers = build_sequence(
-            tok, schema.state(state), schema.question(chunk), budget.max_len, budget.head_max_len
-        )
+        if budget.layout == "causal":
+            ids, markers = build_causal_sequence(
+                tok, schema.state(state), schema.question(chunk), budget.max_len, budget.marker_id, budget.bos_id
+            )
+        else:
+            ids, markers = build_sequence(
+                tok, schema.state(state), schema.question(chunk), budget.max_len, budget.head_max_len
+            )
         if len(markers) != len(chunk) + 1:
             raise ValueError(
                 "%d labels do not fit in max_len=%d; raise max_len or lower labels_per_seq"
