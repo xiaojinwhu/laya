@@ -12,6 +12,7 @@
 - 全参 > LoRA（−0.023）≫ 冻结主干只训头（−0.16）；decoder 上的 2 层随机决策头没有收益。
 - 数据量 400 → 1,600 → 4,000：micro-F1 0.926 → 0.962 → 0.968，exact match 0.78 → 0.90 → 0.92，边际收益递减但 exact match 仍在涨。
 - 中文 60 意图（MASSIVE zh 合成）在同样预算下还远未收敛，见 G 节。
+- **xlm-roberta-large 在同一预算下不可比**（LoRA 0.471 / 全参 0.655）：bf16 主干权重对它有害（fp32 LoRA 0.804），而且起步远慢于 ModernBERT；同样的 LoRA + 随机决策头配方在 ModernBERT-large 上是 0.942（H 节）。
 - Gemma 4 E2B 在这台机器上的尝试见第 4 节。
 
 ## 1. 实验协议
@@ -40,13 +41,14 @@
 
 | 轴 | 变体 |
 |---|---|
-| A 基模 | Laya 英文 ckpt、Laya multilingual ckpt、裸 ModernBERT-large、BERT-mini、Qwen3-0.6B LoRA、Qwen3.5-0.8B LoRA、（Gemma 4 E2B LoRA） |
+| A 基模 | Laya 英文 ckpt、Laya multilingual ckpt、裸 ModernBERT-large、BERT-mini、Qwen3-0.6B LoRA、Qwen3.5-0.8B LoRA、xlm-roberta-large（LoRA / 全参）、（Gemma 4 E2B LoRA） |
 | B 目标函数 | RLCD vs 纯 BCE，在 Laya-en / Qwen3 / BERT-mini 上 |
 | C 训练方式 | 全参 vs LoRA r=16 vs 冻结主干，Laya-en |
 | D 决策头 | 0 层 vs 2 层，Qwen3 LoRA |
 | E 数据量 | 400 / 1,600 / 4,000 条，Laya-en |
 | F 问题构造 | 有无标签描述、是否打乱标签顺序，BERT-mini |
-| G 中文 | Laya-ml、Qwen3-0.6B LoRA、hfl/rbt3，MASSIVE zh 60 意图 |
+| G 中文 | Laya-ml、Qwen3-0.6B LoRA、hfl/rbt3、xlm-roberta-large LoRA，MASSIVE zh 60 意图 |
+| H 诊断 | xlm-roberta-large：LoRA bf16 / fp32 / 0 层头 / 全参，xlm-roberta-base 全参，ModernBERT-large LoRA |
 
 ## 3. 结果
 
@@ -60,6 +62,8 @@
 | A_bertmini_rlcd | 0 | 13 | 12.9 | 0.8326 | 0.7842 | 0.7783 | 0.3979 | 0.0330 | 0.3 | 1.5 | 1.5 |
 | A_qwen3_0.6b_lora | 16 | 608 | 11.4 | 0.9613 | 0.9501 | 0.9498 | 0.8436 | 0.0130 | 15.4 | 2.5 | 102.7 |
 | A_qwen3.5_0.8b_lora | 16 | 764 | 12.1 | 0.9730 | 0.9548 | 0.9543 | 0.8759 | 0.0125 | 32.2 | 3.7 | 270.8 |
+| A_xlmr_large_lora | 16 | 594 | 33.6 | 0.4605 | 0.4709 | 0.4610 | 0.0223 | 0.0942 | 8.2 | 4.2 | 53.2 |
+| A_xlmr_large_full | 0 | 586 | 586.4 | 0.6430 | 0.6552 | 0.6610 | 0.1664 | 0.1579 | 19.1 | 14.3 | 47.4 |
 
 
 ![test micro-F1 and exact match per variant](assets/ablation_test_f1.png)
@@ -71,6 +75,8 @@
 - **Qwen3.5-0.8B > Qwen3-0.6B**（+0.005 F1、+0.03 exact），dev 上差距更大（0.973 vs 0.961）。
 - Laya multilingual（mmBERT-base）在英文上落后英文 checkpoint 2.4 个点，但最小最快，且是中文任务的候选。
 - BERT-mini（11M）0.784：模型容量是硬上限。
+- **xlm-roberta-large 在这个预算下没有进入状态**：LoRA（bf16）0.471、全参 0.655，都远低于同尺寸的 ModernBERT-large。原因在 H 节拆开看了：
+  bf16 权重伤它（fp32 LoRA 能到 0.804），起步本身也慢。
 - Gemma 4 E2B 未能在本机运行，见第 4 节。
 
 ### B. 目标函数：RLCD vs 纯 BCE
@@ -139,12 +145,40 @@
 | G_zh_laya_ml_rlcd | 0 | 322 | 321.9 | 0.6543 | 0.6578 | 0.5804 | 0.2633 | 0.0014 | 15.0 | 11.6 | 85.3 |
 | G_zh_qwen3_0.6b_lora | 16 | 608 | 11.4 | 0.7155 | 0.7243 | 0.6734 | 0.3350 | 0.0026 | 56.1 | 4.7 | 381.8 |
 | G_zh_rbt3_bare | 0 | 53 | 53.5 | 0.1638 | 0.1606 | 0.0324 | 0.0000 | 0.0011 | 6.2 | 5.3 | 34.3 |
+| G_zh_xlmr_large_lora | 16 | 594 | 33.6 | 0.0902 | 0.1052 | 0.0560 | 0.0000 | 0.0027 | 33.9 | 4.7 | 225.9 |
 
 - 60 个意图、中文句子、英文标签描述、100 次更新：Qwen3-0.6B LoRA 0.724 > Laya multilingual 0.658 ≫ 裸 rbt3 0.161。
 - Qwen 的中文能力在这里体现出来（+6.6 个点），代价是 60 个标签的序列约 600 token，训练 56 分钟、推理每条 380 ms（MPS）；Laya-ml 15 分钟、85 ms。
 - rbt3（3 层中文 RoBERTa，随机决策头）在 100 次更新内基本没学到东西；此前用 6,000 条 × 3 epoch 能到 0.60，说明它需要的是步数而不是不可行。
+- xlm-roberta-large LoRA（bf16）0.105：和英文一样没起步，见 H 节；中文 encoder 路线目前 mmBERT（Laya-ml）更可靠。
 - 三个模型的 ECE 都在 0.003 以下但 exact match 只有 0.26–0.34：概率是校准的，只是还不够准。这个任务远未收敛（此前 Laya-ml 在 800 条 × 1 epoch 时是 0.56，这里 1,600 条是 0.66），要认真做需要全量数据、多个 epoch 和中文标签描述。
 
+
+### H. 诊断：XLM-RoBERTa 为什么在这个预算下不行
+
+| variant | lora | params (M) | trainable (M) | dev F1 | test F1 | test macro-F1 | exact | ECE | train min | peak GB | ms/ex (batched) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| A_modernbert_large_bare | 0 | 421 | 421.3 | 0.9753 | 0.9628 | 0.9629 | 0.8909 | 0.0078 | 10.4 | 10.6 | 59.8 |
+| A_modernbert_large_lora | 16 | 428 | 33.7 | 0.9579 | 0.9419 | 0.9424 | 0.8236 | 0.0112 | 9.1 | 4.1 | 67.8 |
+| A_xlmr_base_full | 0 | 293 | 293.0 | 0.5104 | 0.5077 | 0.5097 | 0.0296 | 0.0700 | 3.7 | 9.7 | 15.4 |
+| A_xlmr_large_full | 0 | 586 | 586.4 | 0.6430 | 0.6552 | 0.6610 | 0.1664 | 0.1579 | 19.1 | 14.3 | 47.4 |
+| A_xlmr_large_lora | 16 | 594 | 33.6 | 0.4605 | 0.4709 | 0.4610 | 0.0223 | 0.0942 | 8.2 | 4.2 | 53.2 |
+| A_xlmr_large_lora_head0 | 16 | 568 | 8.4 | 0.4396 | 0.4484 | 0.4483 | 0.0000 | 0.2071 | 7.7 | 2.6 | 49.7 |
+| A_xlmr_large_lora_fp32 | 16 | 594 | 33.6 | 0.8391 | 0.8043 | 0.7797 | 0.4338 | 0.2215 | 8.4 | 5.3 | 57.8 |
+
+`xlm-roberta-large` 是后加进来的（同一预算），第一次跑 LoRA 结果是 0.471——训练 CE 全程停在 0.6 左右，等于没学。为了分清是
+"LoRA + 随机决策头"的配方问题还是 XLM-R 本身，补了五个对照（全部单 seed、100 次更新）：
+
+- **配方没问题**：同样的 LoRA r=16 + 随机 2 层决策头，换成裸 ModernBERT-large 就是 0.942（比它自己全参的 0.963 低 2 个点，和 Laya-en 上 LoRA 的降幅一致）。
+- **bf16 权重伤了 XLM-R**：LoRA 主干改成 fp32，0.471 → **0.804**（exact 0.02 → 0.43）。ModernBERT、Qwen 在 bf16 下都正常，XLM-R
+  的隐状态有很大的离群维度（RoBERTa 系的已知现象），bf16 的 3 位有效数字把 marker 位置的小信号淹掉了。
+- **去掉决策头（0 层）没帮助**：0.448，全部判正。
+- **全参微调也慢**：fp32、encoder lr 1e-5、warmup 5%，0.655；训练曲线（上图紫线）在前 60 次更新几乎不动，之后才缓慢下降；
+  `xlm-roberta-base` 全参更差（0.508）。XLM-R 起步慢、需要几百到上千步 warmup 才进入状态，是它微调时的常见行为，100 次更新对它太短。
+- fp32 LoRA 那次的 ECE 高达 0.22——温度都拉不回来，说明它还处在训练早期，概率没有形成。
+
+结论：**用 XLM-R 时主干必须 fp32（`--load-dtype fp32`），并且要给它比 ModernBERT 多得多的步数**；在这个预算下它不是可比的候选。
+中文场景如果要 encoder 路线，mmBERT（Laya multilingual 的主干）在同样 100 次更新下是 0.658（G 轴），更省事。
 
 ## 4. Gemma 4 E2B
 
@@ -176,6 +210,7 @@ python examples/multilabel_intent/ablate.py run --base examples/multilabel_inten
 4. **decoder 上决策头用 0 层**；encoder 上全参优于 LoRA，冻结主干不可用。
 5. **数据量**：1,600 条已经拿到 micro-F1 的大部分；要提升 exact match 继续加数据。
 6. **中文 60 意图**还没收敛，Qwen3-0.6B LoRA 是当前最好的起点（0.724）。
+7. **XLM-R 系要单独对待**：主干 `--load-dtype fp32`，步数给足（几百次更新起），否则会得到"没学"的假阴性；同尺寸下 ModernBERT-large 好用得多。
 
 **下一步建议**：
 - CUDA 上补 Gemma 4 E2B，并把 Qwen3.5 换到快内核（`flash-linear-attention` + `causal-conv1d`）复测延迟。

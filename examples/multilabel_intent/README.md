@@ -328,6 +328,8 @@ MPS 上报告的"峰值"是按步采样的 `driver_allocated_memory`，是下界
 - **中文及其他非英文数据请用 `subfolder: "multilingual"`**（英文 checkpoint 读不了非拉丁文字，见主 README），
   或者任何多语言掩码模型（`FacebookAI/xlm-roberta-large`、`jhu-clsp/mmBERT-base` 等）。RoBERTa 系的
   `max_position_embeddings=514` 实际只有 512 个可用位置（位置 id 从 `padding_idx+1` 起算），序列预算按 512 规划。
+  **XLM-R 用 LoRA 时加 `--load-dtype fp32`**（bf16 主干让它学不动：同预算下 0.47 vs 0.80），并且它起步很慢，
+  步数要给足——详见 [REPORT.md](REPORT.md) 的 H 节。
 - **标签很多时**（60+）：序列会变长，`head_max_len` / `max_len` 会自动放大并写回 checkpoint 配置；
   encoder 位置上限不够（如 BERT 的 512）时自动分块，推理时各块仍在同一个 batch 里一次前向完成。
 - macOS 上 `torchrun --standalone` 可能因主机名解析失败而卡住，改用

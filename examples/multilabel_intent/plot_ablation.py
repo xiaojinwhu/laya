@@ -61,16 +61,23 @@ def bars(rows, groups, path):
     plt.close(fig)
 
 
-def curves(db, names, path):
+def curves(db, names, path, out_dir=None):
+    """Steps are logged in micro-batches; runs with different micro-batch sizes are put on one
+    x-axis of optimizer updates using each run's grad_accum from its saved config."""
     con = sqlite3.connect(db)
     series = {}
     for name in names:
+        accum = 1
+        cfg_path = os.path.join(out_dir or "", name, "rl_agent_config.json")
+        if out_dir and os.path.exists(cfg_path):
+            with open(cfg_path) as f:
+                accum = json.load(f).get("training", {}).get("config", {}).get("grad_accum", 1) or 1
         pts = con.execute("select step, metrics from metrics where run_name = ? order by step, id", (name,)).fetchall()
         xs, loss, rew = [], [], []
         for step, m in pts:
             m = json.loads(m)
             if "train/loss_ce" in m:
-                xs.append(step)
+                xs.append(step / accum)
                 loss.append(m["train/loss_ce"])
                 rew.append(m.get("train/reward"))
         if xs:
@@ -82,7 +89,7 @@ def curves(db, names, path):
         axes[1].plot(xs, rew, color=color, linewidth=2, label=name)
     for ax, title in zip(axes, ("Soft cross-entropy per label decision (train)", "Proper-scoring reward (train)")):
         ax.set_title(title, fontsize=11, color=INK, loc="left")
-        ax.set_xlabel("micro-batches", fontsize=9, color=MUTED)
+        ax.set_xlabel("optimizer updates", fontsize=9, color=MUTED)
         style(ax)
         ax.grid(axis="y", color=GRID, linewidth=0.6)
         ax.grid(axis="x", visible=False)
@@ -114,7 +121,7 @@ def main():
     print("wrote", os.path.join(args.assets, "ablation_test_f1.png"))
     if args.curves:
         db = os.path.join(args.trackio_dir, args.project + ".db")
-        curves(db, [c.strip() for c in args.curves.split(",") if c.strip()], os.path.join(args.assets, "ablation_curves.png"))
+        curves(db, [c.strip() for c in args.curves.split(",") if c.strip()], os.path.join(args.assets, "ablation_curves.png"), args.out)
         print("wrote", os.path.join(args.assets, "ablation_curves.png"))
 
 

@@ -1,36 +1,247 @@
 [
-  {"name": "A_laya_en_rlcd", "overrides": {}},
-  {"name": "A_laya_ml_rlcd", "overrides": {"subfolder": "multilingual"}},
-  {"name": "A_modernbert_large_bare", "overrides": {"init": "answerdotai/ModernBERT-large", "lr_head": 5e-4, "warmup_ratio": 0.05}},
-  {"name": "A_bertmini_rlcd", "overrides": {"init": "google/bert_uncased_L-4_H-256_A-4", "lr_encoder": 1e-4, "lr_head": 5e-4, "warmup_ratio": 0.05}},
-  {"name": "A_qwen3_0.6b_lora", "overrides": {"init": "Qwen/Qwen3-0.6B-Base", "lora_r": 16}},
-  {"name": "A_qwen3.5_0.8b_lora", "overrides": {"init": "Qwen/Qwen3.5-0.8B-Base", "lora_r": 16}},
-
-  {"name": "B_laya_en_bce", "overrides": {"rl_weight": 0}},
-  {"name": "B_qwen3_0.6b_lora_bce", "overrides": {"init": "Qwen/Qwen3-0.6B-Base", "lora_r": 16, "rl_weight": 0}},
-  {"name": "B_bertmini_bce", "overrides": {"init": "google/bert_uncased_L-4_H-256_A-4", "lr_encoder": 1e-4, "lr_head": 5e-4, "warmup_ratio": 0.05, "rl_weight": 0}},
-
-  {"name": "C_laya_en_lora16", "overrides": {"lora_r": 16}},
-  {"name": "C_laya_en_frozen", "overrides": {"freeze_encoder": true}},
-
-  {"name": "D_qwen3_0.6b_lora_head2", "overrides": {"init": "Qwen/Qwen3-0.6B-Base", "lora_r": 16, "head_layers": 2}},
-
-  {"name": "E_laya_en_n400", "overrides": {"limit_train": 400}},
-  {"name": "E_laya_en_n4000", "overrides": {"limit_train": 4000}},
-
-  {"name": "F_bertmini_nodesc", "overrides": {"init": "google/bert_uncased_L-4_H-256_A-4", "lr_encoder": 1e-4, "lr_head": 5e-4, "warmup_ratio": 0.05, "labels_file": "examples/multilabel_intent/labels_mixsnips_names_only.json"}},
-  {"name": "F_bertmini_noshuffle", "overrides": {"init": "google/bert_uncased_L-4_H-256_A-4", "lr_encoder": 1e-4, "lr_head": 5e-4, "warmup_ratio": 0.05, "shuffle_labels": false}},
-
-  {"name": "G_zh_laya_ml_rlcd", "overrides": {"subfolder": "multilingual", "pos_weight": 2.0, "micro_batch": 4, "grad_accum": 4,
-    "train_file": "examples/multilabel_intent/data/massive_zh/train.jsonl", "dev_file": "examples/multilabel_intent/data/massive_zh/dev.jsonl",
-    "test_file": "examples/multilabel_intent/data/massive_zh/test.jsonl", "labels_file": "examples/multilabel_intent/data/massive_zh/labels.json",
-    "limit_eval": 300, "limit_test": 600, "eval_batch_size": 8}},
-  {"name": "G_zh_qwen3_0.6b_lora", "overrides": {"init": "Qwen/Qwen3-0.6B-Base", "lora_r": 16, "pos_weight": 2.0, "micro_batch": 4, "grad_accum": 4,
-    "train_file": "examples/multilabel_intent/data/massive_zh/train.jsonl", "dev_file": "examples/multilabel_intent/data/massive_zh/dev.jsonl",
-    "test_file": "examples/multilabel_intent/data/massive_zh/test.jsonl", "labels_file": "examples/multilabel_intent/data/massive_zh/labels.json",
-    "limit_eval": 300, "limit_test": 600, "eval_batch_size": 8}},
-  {"name": "G_zh_rbt3_bare", "overrides": {"init": "hfl/rbt3", "lr_encoder": 1e-4, "lr_head": 5e-4, "warmup_ratio": 0.05, "pos_weight": 2.0, "micro_batch": 8, "grad_accum": 2,
-    "train_file": "examples/multilabel_intent/data/massive_zh/train.jsonl", "dev_file": "examples/multilabel_intent/data/massive_zh/dev.jsonl",
-    "test_file": "examples/multilabel_intent/data/massive_zh/test.jsonl", "labels_file": "examples/multilabel_intent/data/massive_zh/labels.json",
-    "limit_eval": 300, "limit_test": 600, "eval_batch_size": 16}}
+  {
+    "name": "A_laya_en_rlcd",
+    "overrides": {}
+  },
+  {
+    "name": "A_laya_ml_rlcd",
+    "overrides": {
+      "subfolder": "multilingual"
+    }
+  },
+  {
+    "name": "A_modernbert_large_bare",
+    "overrides": {
+      "init": "answerdotai/ModernBERT-large",
+      "lr_head": 0.0005,
+      "warmup_ratio": 0.05
+    }
+  },
+  {
+    "name": "A_bertmini_rlcd",
+    "overrides": {
+      "init": "google/bert_uncased_L-4_H-256_A-4",
+      "lr_encoder": 0.0001,
+      "lr_head": 0.0005,
+      "warmup_ratio": 0.05
+    }
+  },
+  {
+    "name": "A_qwen3_0.6b_lora",
+    "overrides": {
+      "init": "Qwen/Qwen3-0.6B-Base",
+      "lora_r": 16
+    }
+  },
+  {
+    "name": "A_qwen3.5_0.8b_lora",
+    "overrides": {
+      "init": "Qwen/Qwen3.5-0.8B-Base",
+      "lora_r": 16
+    }
+  },
+  {
+    "name": "B_laya_en_bce",
+    "overrides": {
+      "rl_weight": 0
+    }
+  },
+  {
+    "name": "B_qwen3_0.6b_lora_bce",
+    "overrides": {
+      "init": "Qwen/Qwen3-0.6B-Base",
+      "lora_r": 16,
+      "rl_weight": 0
+    }
+  },
+  {
+    "name": "B_bertmini_bce",
+    "overrides": {
+      "init": "google/bert_uncased_L-4_H-256_A-4",
+      "lr_encoder": 0.0001,
+      "lr_head": 0.0005,
+      "warmup_ratio": 0.05,
+      "rl_weight": 0
+    }
+  },
+  {
+    "name": "C_laya_en_lora16",
+    "overrides": {
+      "lora_r": 16
+    }
+  },
+  {
+    "name": "C_laya_en_frozen",
+    "overrides": {
+      "freeze_encoder": true
+    }
+  },
+  {
+    "name": "D_qwen3_0.6b_lora_head2",
+    "overrides": {
+      "init": "Qwen/Qwen3-0.6B-Base",
+      "lora_r": 16,
+      "head_layers": 2
+    }
+  },
+  {
+    "name": "E_laya_en_n400",
+    "overrides": {
+      "limit_train": 400
+    }
+  },
+  {
+    "name": "E_laya_en_n4000",
+    "overrides": {
+      "limit_train": 4000
+    }
+  },
+  {
+    "name": "F_bertmini_nodesc",
+    "overrides": {
+      "init": "google/bert_uncased_L-4_H-256_A-4",
+      "lr_encoder": 0.0001,
+      "lr_head": 0.0005,
+      "warmup_ratio": 0.05,
+      "labels_file": "examples/multilabel_intent/labels_mixsnips_names_only.json"
+    }
+  },
+  {
+    "name": "F_bertmini_noshuffle",
+    "overrides": {
+      "init": "google/bert_uncased_L-4_H-256_A-4",
+      "lr_encoder": 0.0001,
+      "lr_head": 0.0005,
+      "warmup_ratio": 0.05,
+      "shuffle_labels": false
+    }
+  },
+  {
+    "name": "G_zh_laya_ml_rlcd",
+    "overrides": {
+      "subfolder": "multilingual",
+      "pos_weight": 2.0,
+      "micro_batch": 4,
+      "grad_accum": 4,
+      "train_file": "examples/multilabel_intent/data/massive_zh/train.jsonl",
+      "dev_file": "examples/multilabel_intent/data/massive_zh/dev.jsonl",
+      "test_file": "examples/multilabel_intent/data/massive_zh/test.jsonl",
+      "labels_file": "examples/multilabel_intent/data/massive_zh/labels.json",
+      "limit_eval": 300,
+      "limit_test": 600,
+      "eval_batch_size": 8
+    }
+  },
+  {
+    "name": "G_zh_qwen3_0.6b_lora",
+    "overrides": {
+      "init": "Qwen/Qwen3-0.6B-Base",
+      "lora_r": 16,
+      "pos_weight": 2.0,
+      "micro_batch": 4,
+      "grad_accum": 4,
+      "train_file": "examples/multilabel_intent/data/massive_zh/train.jsonl",
+      "dev_file": "examples/multilabel_intent/data/massive_zh/dev.jsonl",
+      "test_file": "examples/multilabel_intent/data/massive_zh/test.jsonl",
+      "labels_file": "examples/multilabel_intent/data/massive_zh/labels.json",
+      "limit_eval": 300,
+      "limit_test": 600,
+      "eval_batch_size": 8
+    }
+  },
+  {
+    "name": "G_zh_rbt3_bare",
+    "overrides": {
+      "init": "hfl/rbt3",
+      "lr_encoder": 0.0001,
+      "lr_head": 0.0005,
+      "warmup_ratio": 0.05,
+      "pos_weight": 2.0,
+      "micro_batch": 8,
+      "grad_accum": 2,
+      "train_file": "examples/multilabel_intent/data/massive_zh/train.jsonl",
+      "dev_file": "examples/multilabel_intent/data/massive_zh/dev.jsonl",
+      "test_file": "examples/multilabel_intent/data/massive_zh/test.jsonl",
+      "labels_file": "examples/multilabel_intent/data/massive_zh/labels.json",
+      "limit_eval": 300,
+      "limit_test": 600,
+      "eval_batch_size": 16
+    }
+  },
+  {
+    "name": "A_xlmr_large_lora",
+    "overrides": {
+      "init": "FacebookAI/xlm-roberta-large",
+      "lora_r": 16,
+      "lr_head": 0.0005,
+      "warmup_ratio": 0.05
+    }
+  },
+  {
+    "name": "G_zh_xlmr_large_lora",
+    "overrides": {
+      "init": "FacebookAI/xlm-roberta-large",
+      "lora_r": 16,
+      "lr_head": 0.0005,
+      "warmup_ratio": 0.05,
+      "pos_weight": 2.0,
+      "micro_batch": 4,
+      "grad_accum": 4,
+      "train_file": "examples/multilabel_intent/data/massive_zh/train.jsonl",
+      "dev_file": "examples/multilabel_intent/data/massive_zh/dev.jsonl",
+      "test_file": "examples/multilabel_intent/data/massive_zh/test.jsonl",
+      "labels_file": "examples/multilabel_intent/data/massive_zh/labels.json",
+      "limit_eval": 300,
+      "limit_test": 600,
+      "eval_batch_size": 8
+    }
+  },
+  {
+    "name": "A_xlmr_large_full",
+    "overrides": {
+      "init": "FacebookAI/xlm-roberta-large",
+      "lr_encoder": 1e-05,
+      "lr_head": 0.0005,
+      "warmup_ratio": 0.05,
+      "micro_batch": 4,
+      "grad_accum": 4
+    }
+  },
+  {
+    "name": "A_xlmr_large_lora_head0",
+    "overrides": {
+      "init": "FacebookAI/xlm-roberta-large",
+      "lora_r": 16,
+      "head_layers": 0,
+      "lr_head": 0.0005,
+      "warmup_ratio": 0.05
+    }
+  },
+  {
+    "name": "A_modernbert_large_lora",
+    "overrides": {
+      "init": "answerdotai/ModernBERT-large",
+      "lora_r": 16,
+      "lr_head": 0.0005,
+      "warmup_ratio": 0.05
+    }
+  },
+  {
+    "name": "A_xlmr_large_lora_fp32",
+    "overrides": {
+      "init": "FacebookAI/xlm-roberta-large",
+      "lora_r": 16,
+      "load_dtype": "fp32",
+      "lr_head": 0.0005,
+      "warmup_ratio": 0.05
+    }
+  },
+  {
+    "name": "A_xlmr_base_full",
+    "overrides": {
+      "init": "FacebookAI/xlm-roberta-base",
+      "lr_head": 0.0005,
+      "warmup_ratio": 0.05
+    }
+  }
 ]
