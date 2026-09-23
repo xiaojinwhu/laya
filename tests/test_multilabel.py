@@ -470,6 +470,48 @@ if HAVE_TRACKIO:
 else:
     print("   SKIP tracking/trackio (not installed)")
 
+# ---------------------------------------------------------------- 9. RoBERTa-style position offset
+head("9. RoBERTa-family backbone: position ids start at padding_idx + 1 (tiny random XLM-R, CPU)")
+from transformers import AutoModel, XLMRobertaConfig, XLMRobertaModel  # noqa: E402
+
+from laya.multilabel.backbone import usable_positions  # noqa: E402
+
+XR = os.path.join(tmp.name, "xlmr")
+tok.save_pretrained(XR)
+torch.manual_seed(0)
+N_POS = 98
+XLMRobertaModel(XLMRobertaConfig(vocab_size=len(tok), hidden_size=64, num_hidden_layers=2, num_attention_heads=2,
+                                 intermediate_size=128, max_position_embeddings=N_POS,
+                                 pad_token_id=tok.pad_token_id)).save_pretrained(XR)
+xr = AutoModel.from_pretrained(XR)
+usable = N_POS - tok.pad_token_id - 1
+ok("xlmr/usable positions exclude the padding offset", usable_positions(xr) == usable, usable_positions(xr))
+ok("xlmr/other backbones are untouched", usable_positions(AutoModel.from_pretrained(ENC)) == 256
+   and usable_positions(AutoModel.from_pretrained(DEC)) == 512)
+with torch.no_grad():
+    xr(input_ids=torch.randint(5, len(tok), (1, usable)))
+    try:
+        xr(input_ids=torch.randint(5, len(tok), (1, usable + 1)))
+        ok("xlmr/one token past the usable length really fails", False)
+    except (IndexError, RuntimeError):
+        ok("xlmr/one token past the usable length really fails", True)
+
+# states far longer than the budget: every sequence is cut to exactly max_len, so max_len must be addressable
+LONG = os.path.join(tmp.name, "long.jsonl")
+with open(LONG, "w") as f:
+    for r in (json.loads(line) for line in open(DATA)):
+        f.write(json.dumps({"text": (r["text"] + " ") * 40, "labels": r["labels"]}) + "\n")
+OUT_X = os.path.join(tmp.name, "out_xlmr")
+try:
+    train(TrainConfig(train_file=LONG, dev_file=LONG, labels_file=LABELS_FILE, init=XR, output_dir=OUT_X, device="cpu",
+                      epochs=1, micro_batch=8, grad_accum=1, state_budget=40, log_every=10 ** 6, eval_before_train=False))
+    saved_x = json.load(open(os.path.join(OUT_X, "rl_agent_config.json")))
+    ok("xlmr/sequences are budgeted within the usable positions", saved_x["max_len"] == usable, saved_x["max_len"])
+    ag_x = MultiLabelAgent(OUT_X, device="cpu")
+    ok("xlmr/inference on long states works from disk", ag_x.probabilities([("play jazz " * 80)]).shape == (1, 4))
+except (IndexError, RuntimeError) as e:
+    ok("xlmr/training with truncated long states does not overflow the position table", False, e)
+
 # ---------------------------------------------------------------- summary
 head("SUMMARY")
 print("\n   %d passed, %d failed" % (len(PASS), len(FAIL)))

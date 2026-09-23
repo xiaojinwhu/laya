@@ -229,6 +229,21 @@ def peak_memory_gb(device: torch.device) -> Optional[float]:
     return None
 
 
+def usable_positions(encoder) -> int:
+    """Positions a backbone can actually address.
+
+    RoBERTa-style embeddings (RoBERTa, XLM-R, CamemBERT, ...) start position ids at
+    `padding_idx + 1`, so `max_position_embeddings` (514) overstates the usable length (512) by
+    `padding_idx + 1`; a sequence of 513 tokens raises an index error in the position table.
+    """
+    n = int(getattr(encoder.config, "max_position_embeddings", 512))
+    emb = getattr(encoder, "embeddings", None)
+    pad = getattr(emb, "padding_idx", None)
+    if isinstance(pad, int) and pad >= 0 and hasattr(emb, "position_embeddings"):
+        n -= pad + 1
+    return n
+
+
 def local_model_dir(path: str, subfolder: Optional[str]) -> Optional[str]:
     """`path[/subfolder]` when it is a directory on disk, else None."""
     p = os.path.join(path, subfolder) if subfolder else path

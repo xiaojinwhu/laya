@@ -25,7 +25,7 @@ from ..agent import _fix_tokenizer_config
 from ..common import DecisionModel, build_model, collate_items
 from .agent import score_states
 from .backbone import (
-    apply_lora, ensure_pad, head_state_dict, load_backbone, param_counts, peak_memory_gb, pick_marker,
+    apply_lora, ensure_pad, head_state_dict, load_backbone, param_counts, peak_memory_gb, pick_marker, usable_positions,
 )
 from .calibration import fit_temperature, sigmoid, tune_thresholds
 from .data import Budget, CachedTokenizer, Example, build_items, infer_labels, plan_budget, read_jsonl
@@ -346,7 +346,7 @@ def train(cfg: TrainConfig) -> Dict:
     base = load_base(cfg, device)
     raw_tok, model, mcfg = base.tok, base.model, base.mcfg
     tok = CachedTokenizer(raw_tok)
-    max_positions = int(getattr(model.encoder.config, "max_position_embeddings", 512))
+    max_positions = usable_positions(model.encoder)
     budget = plan_budget(tok, schema, max_positions, cfg.state_budget, mcfg.get("max_len", 512),
                          mcfg.get("head_max_len", 192), cfg.labels_per_seq, base.layout, base.marker_id, base.bos_id)
     if cfg.head_max_len:

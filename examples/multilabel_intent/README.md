@@ -325,7 +325,9 @@ MPS 上报告的"峰值"是按步采样的 `driver_allocated_memory`，是下界
 ## 注意事项
 
 - **标签描述很重要**。模型通过阅读 `名字: 描述` 来判断，`atis_flight` 这种名字最好配上一句话描述。
-- **中文及其他非英文数据请用 `subfolder: "multilingual"`**（英文 checkpoint 读不了非拉丁文字，见主 README）。
+- **中文及其他非英文数据请用 `subfolder: "multilingual"`**（英文 checkpoint 读不了非拉丁文字，见主 README），
+  或者任何多语言掩码模型（`FacebookAI/xlm-roberta-large`、`jhu-clsp/mmBERT-base` 等）。RoBERTa 系的
+  `max_position_embeddings=514` 实际只有 512 个可用位置（位置 id 从 `padding_idx+1` 起算），序列预算按 512 规划。
 - **标签很多时**（60+）：序列会变长，`head_max_len` / `max_len` 会自动放大并写回 checkpoint 配置；
   encoder 位置上限不够（如 BERT 的 512）时自动分块，推理时各块仍在同一个 batch 里一次前向完成。
 - macOS 上 `torchrun --standalone` 可能因主机名解析失败而卡住，改用
