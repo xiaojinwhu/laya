@@ -405,6 +405,25 @@ as a fast base to specialise, not as a zero-shot decision engine.
 
 Runtime on 2xT4 is roughly 4-5 hours for 4 epochs over ~30k questions.
 
+### Multi-label classification
+
+`choice` picks one option and `noul` decides one statement; neither says which of K intents are
+present in an utterance that may carry several. `laya.multilabel` adds that as a fourth primitive
+without touching the architecture: a threshold option is placed in front of the labels, each label
+is the two-way (`noul`) decision between the threshold and its own marker, and all K decisions are
+read from a single forward pass. Training is the same RLCD loop as the notebook, applied per label
+decision. The result is an ordinary Laya checkpoint.
+
+```bash
+python examples/multilabel_intent/prepare_data.py mixsnips --out examples/multilabel_intent/data/mixsnips
+python -m laya.multilabel train --config examples/multilabel_intent/config.mixsnips.json
+python -m laya.multilabel predict --model examples/multilabel_intent/runs/mixsnips_laya \
+    --text "play some jazz and book a table for two"
+```
+
+See [`examples/multilabel_intent/`](examples/multilabel_intent/README.md) for the algorithm, data
+format, options and measured results.
+
 ---
 
 ## Support the Project

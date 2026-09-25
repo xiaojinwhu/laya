@@ -1,0 +1,19 @@
+{
+  "train_file": "examples/multilabel_intent/data/massive_zh/train.jsonl",
+  "dev_file": "examples/multilabel_intent/data/massive_zh/dev.jsonl",
+  "test_file": "examples/multilabel_intent/data/massive_zh/test.jsonl",
+  "labels_file": "examples/multilabel_intent/data/massive_zh/labels.json",
+  "output_dir": "examples/multilabel_intent/runs/massive_zh_laya_ml",
+
+  "init": "convaiinnovations/laya",
+  "subfolder": "multilingual",
+
+  "epochs": 3,
+  "micro_batch": 8,
+  "grad_accum": 4,
+  "lr_encoder": 2.5e-5,
+  "lr_head": 1e-4,
+  "pos_weight": 2.0,
+
+  "threshold_mode": "global"
+}
