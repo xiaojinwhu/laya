@@ -7,7 +7,8 @@ Part B  typed-decisions (400 cases / 2,000 decisions) on all three checkpoints, 
 
 Writes local_benchmark_results.json.
 
-  USE_TF=0 python3 notebooks/bench_local.py [--langs N] [--per-lang N] [--skip-a] [--skip-b]
+  USE_TF=0 python3 research/scripts/bench_local.py [--langs N] [--per-lang N] [--skip-a] [--skip-b]
+      [--distractors random|scenario] [--criteria rewrite|key]
 """
 import argparse
 import gc
@@ -26,18 +27,64 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(REPO, "laya"))
+RESEARCH = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO = os.path.dirname(RESEARCH)
+sys.path.insert(0, REPO)
 
 import laya  # noqa: E402
 from laya.common import QTYPES, build_sequence, collate_items, render_options, temp_bucket  # noqa: E402
 
-ROOT = os.path.expanduser("~/laya_models")
-MODELS = {"english": os.path.join(ROOT, "laya"),
-          "multilingual": os.path.join(ROOT, "laya-multilingual"),
-          "typed-decisions": os.path.join(ROOT, "laya-typed-decisions")}
-OUT = os.path.join(REPO, "local_benchmark_results.json")
+# Local checkpoint dirs are used when present, otherwise the Hugging Face repo is downloaded.
+ROOT = os.path.expanduser(os.environ.get("LAYA_MODELS", "~/laya_models"))
+MODELS = {"english": (os.path.join(ROOT, "laya"), "convaiinnovations/laya"),
+          "multilingual": (os.path.join(ROOT, "laya-multilingual"), "convaiinnovations/laya-multilingual"),
+          "typed-decisions": (os.path.join(ROOT, "laya-typed-decisions"), "convaiinnovations/laya-typed-decisions")}
+OUT = os.path.join(RESEARCH, "results", "local_benchmark_results.json")
+TYPED_DECISIONS = os.environ.get(
+    "TYPED_DECISIONS_PARQUET", os.path.join(RESEARCH, "typed-decisions", "all", "test-00000-of-00001.parquet"))
 SEED, N_OPTS = 13, 20
+N_BOOT = 1000
+
+
+# ------------------------------------------------------------------ sampling
+def sample_rows(rows, n, label_fn, seed=SEED):
+    """Up to n rows, stratified by label: shuffle each label's rows, then take them round-robin.
+
+    Hugging Face test splits are often sorted by label (banking77 is 40 rows per label in label
+    order), so `rows[:n]` would evaluate only the first few labels.
+    """
+    rng = random.Random(seed)
+    by_label = {}
+    for r in rows:
+        by_label.setdefault(label_fn(r), []).append(r)
+    pools = [by_label[k] for k in sorted(by_label, key=str)]
+    for p in pools:
+        rng.shuffle(p)
+    rng.shuffle(pools)
+    out, i = [], 0
+    while len(out) < n and any(i < len(p) for p in pools):
+        out.extend(p[i] for p in pools if i < len(p))
+        i += 1
+    out = out[:n]
+    rng.shuffle(out)
+    return out
+
+
+def pick_distractors(rng, gold, labels, n_opts, mode="random"):
+    """gold + n_opts-1 distractors. mode="scenario" fills first from labels sharing gold's
+    scenario prefix (MASSIVE `alarm_set` -> `alarm_*`), the confusable negatives in real traffic."""
+    pool = [x for x in labels if x != gold]
+    k = min(n_opts - 1, len(pool))
+    if mode == "scenario":
+        scen = gold.split("_", 1)[0]
+        near = [x for x in pool if x.split("_", 1)[0] == scen]
+        far = [x for x in pool if x.split("_", 1)[0] != scen]
+        near = rng.sample(near, min(k, len(near)))
+        keys = [gold] + near + rng.sample(far, k - len(near))
+    else:
+        keys = [gold] + rng.sample(pool, k)
+    rng.shuffle(keys)
+    return keys
 
 
 # ------------------------------------------------------------------ engine
@@ -119,6 +166,42 @@ def ece_score(conf, corr, bins=15):
     return float(e)
 
 
+def ece_equal_mass(conf, corr, bins=10):
+    """ECE with equal-count bins; stabler than fixed-width bins at a few hundred samples."""
+    conf, corr = np.asarray(conf, float), np.asarray(corr, float)
+    if not len(conf):
+        return float("nan")
+    o = np.argsort(conf)
+    return float(sum(len(b) / len(o) * abs(conf[b].mean() - corr[b].mean())
+                     for b in np.array_split(o, min(bins, len(o))) if len(b)))
+
+
+def bootstrap_ci(corr, n_boot=N_BOOT, seed=SEED):
+    corr = np.asarray(corr, float)
+    if not len(corr):
+        return [float("nan"), float("nan")]
+    rs = np.random.RandomState(seed)
+    means = corr[rs.randint(0, len(corr), (n_boot, len(corr)))].mean(1)
+    return [round(float(np.percentile(means, 2.5)), 4), round(float(np.percentile(means, 97.5)), 4)]
+
+
+def mcnemar(corr_a, corr_b):
+    """Exact two-sided McNemar test on paired per-item correctness (same questions, two models)."""
+    a, b = np.asarray(corr_a, bool), np.asarray(corr_b, bool)
+    n01, n10 = int((~a & b).sum()), int((a & ~b).sum())
+    n = n01 + n10
+    if n == 0:
+        return {"a_only": n10, "b_only": n01, "p_value": 1.0}
+    k = min(n01, n10)
+    p = min(1.0, 2 * sum(math.comb(n, i) for i in range(k + 1)) / 2 ** n)
+    return {"a_only": n10, "b_only": n01, "p_value": round(p, 6)}
+
+
+def correctness(rows):
+    """Per-item 0/1 correctness; a dropped question (probs None) counts as wrong."""
+    return np.array([0.0 if p is None else float(int(np.argmax(p)) == g) for g, p in rows])
+
+
 def macro_f1(g, p):
     g, p = np.asarray(g), np.asarray(p)
     f = []
@@ -130,12 +213,20 @@ def macro_f1(g, p):
 
 
 def metrics(rows):
+    """Accuracy (with bootstrap 95% CI) counts dropped questions as wrong; calibration metrics
+    are over the scored questions only."""
+    all_corr = correctness(rows)
+    n_dropped = sum(1 for r in rows if r[1] is None)
     rows = [r for r in rows if r[1] is not None]
     if not rows:
-        return {"n": 0}
+        return {"n": 0, "n_dropped": n_dropped}
     g = np.array([x[0] for x in rows]); p = np.array([int(np.argmax(x[1])) for x in rows])
     c = np.array([float(np.max(x[1])) for x in rows]); corr = (p == g).astype(float)
-    return {"n": len(rows), "accuracy": round(float(corr.mean()), 4),
+    return {"n": len(rows) + n_dropped, "n_dropped": n_dropped,
+            "accuracy": round(float(all_corr.mean()), 4),
+            "accuracy_ci95": bootstrap_ci(all_corr),
+            "accuracy_scored_only": round(float(corr.mean()), 4),
+            "ece_equal_mass": round(ece_equal_mass(c, corr), 4),
             "macro_f1": round(macro_f1(g, p), 4), "ece": round(ece_score(c, corr), 4),
             "brier": round(float(np.mean([((np.asarray(x[1]) - np.eye(len(x[1]))[x[0]]) ** 2).sum()
                                           for x in rows])), 4),
@@ -145,9 +236,37 @@ def metrics(rows):
 
 
 def load(name):
-    ag = laya.load(MODELS[name], device="cpu")
+    local, repo = MODELS[name]
+    ag = laya.load(local if os.path.isdir(local) else repo, device="cpu")
     ag.model.eval()
     return ag
+
+
+def option_flip_rate(agent, cases, limit=200, seed=SEED):
+    """Fraction of choice questions whose chosen label changes when the options are permuted."""
+    rng = random.Random(seed)
+    base, perm = [], []
+    for state, qs in cases[:limit]:
+        for qid, qd in qs.items():
+            if qd["type"] != "choice" or not isinstance(qd.get("criteria"), dict):
+                continue
+            keys = list(qd["criteria"])
+            shuffled = keys[:]
+            rng.shuffle(shuffled)
+            base.append((state, {qid: qd}))
+            perm.append((state, {qid: {**qd, "criteria": {k: qd["criteria"][k] for k in shuffled}}}))
+    if not base:
+        return None
+    la, ia, _, _ = score_cases(agent, base)
+    lb, ib, _, _ = score_cases(agent, perm)
+    flips, n = 0, 0
+    for (sa, qa), (sb, qb), za, zb in zip(base, perm, la, lb):
+        if za is None or zb is None:
+            continue
+        qid = next(iter(qa))
+        flips += list(qa[qid]["criteria"])[int(np.argmax(za))] != list(qb[qid]["criteria"])[int(np.argmax(zb))]
+        n += 1
+    return {"n": n, "flip_rate": round(flips / max(1, n), 4)}
 
 
 # ------------------------------------------------------------------ part A
@@ -157,23 +276,36 @@ def massive_languages():
     return sorted({m.group(1) for f in files for m in [re.match(r"test/([A-Za-z\-]+)\.json", f)] if m})
 
 
-def build_massive(langs, per_lang):
+def render_intent_criteria(keys, style):
+    if style == "key":
+        return {k: None for k in keys}
+    return {k: k.replace("_", " ").replace(".", ": ") for k in keys}
+
+
+def build_massive(langs, per_lang, distractors="random", criteria="rewrite"):
     from datasets import load_dataset
-    suites = {}
-    for lg in langs:
+    suites, en_ids = {}, None
+    for lg in sorted(langs, key=lambda x: x != "en"):
         try:
             d = load_dataset("mteb/amazon_massive_intent", lg, split="test")
             labels = sorted(set(d["label_text"]))
             rng = random.Random(SEED)
+            rows = list(d)
+            # MASSIVE is parallel: evaluate the same utterance ids in every language
+            if en_ids is not None and "id" in d.column_names:
+                keep = {r["id"]: r for r in rows}
+                picked = [keep[i] for i in en_ids if i in keep]
+            else:
+                picked = sample_rows(rows, per_lang, lambda r: r["label_text"])
+                if lg == "en" and "id" in d.column_names:
+                    en_ids = [r["id"] for r in picked]
             cases, gold = [], []
-            for r in list(d)[:per_lang]:
-                pool = [x for x in labels if x != r["label_text"]]
-                keys = [r["label_text"]] + rng.sample(pool, min(N_OPTS - 1, len(pool)))
-                rng.shuffle(keys)
+            for r in picked:
+                keys = pick_distractors(rng, r["label_text"], labels, N_OPTS, distractors)
                 cases.append(({"utterance": r["text"]},
                               {"intent": {"type": "choice",
                                           "instructions": "What is the user asking for in `utterance`?",
-                                          "criteria": {k: k.replace("_", " ").replace(".", ": ") for k in keys}}}))
+                                          "criteria": render_intent_criteria(keys, criteria)}}))
                 gold.append(keys.index(r["label_text"]))
             suites[lg] = (cases, gold, len(labels))
             print("   built %-8s %d cases (%d labels)" % (lg, len(cases), len(labels)), flush=True)
@@ -182,12 +314,15 @@ def build_massive(langs, per_lang):
     return suites
 
 
-def run_part_a(results, langs, per_lang):
-    print("\n=== PART A: MASSIVE intent, %d languages, %d cases each, %d options ===\n"
-          % (len(langs), per_lang, N_OPTS), flush=True)
-    suites = build_massive(langs, per_lang)
+def run_part_a(results, langs, per_lang, distractors="random", criteria="rewrite"):
+    print("\n=== PART A: MASSIVE intent, %d languages, %d cases each, %d options (%s distractors, %s criteria) ===\n"
+          % (len(langs), per_lang, N_OPTS, distractors, criteria), flush=True)
+    suites = build_massive(langs, per_lang, distractors, criteria)
     results["part_a"] = {"config": {"languages": sorted(suites), "per_lang": per_lang,
-                                    "n_options": N_OPTS, "seed": SEED}, "by_model": {}}
+                                    "n_options": N_OPTS, "seed": SEED, "distractors": distractors,
+                                    "criteria": criteria, "sampling": "stratified by label, parallel ids"},
+                         "by_model": {}, "paired_english_vs_multilingual": {}}
+    corr_by = {}
     for mname in ("english", "multilingual"):
         print("\n--- %s ---" % mname, flush=True)
         ag = load(mname)
@@ -197,6 +332,9 @@ def run_part_a(results, langs, per_lang):
             rows = [(gold[ci], softmax_t(z, temp_for(ag, qt, k)) if z is not None else None)
                     for (ci, _, qt, k), z in zip(idx, lgs)]
             m = metrics(rows); m["seconds"] = round(secs, 1); m["dropped"] = dropped
+            corr_by.setdefault(mname, {})[lg] = correctness(rows)
+            if lg == "en":
+                m["option_order"] = option_flip_rate(ag, cases)
             per[lg] = m
             print("   %-8s acc %.3f  f1 %.3f  ECE %.3f  conf %.3f  (%.0f q/s)"
                   % (lg, m["accuracy"], m["macro_f1"], m["ece"], m["mean_confidence"],
@@ -215,13 +353,16 @@ def run_part_a(results, langs, per_lang):
                  results["part_a"]["by_model"][mname]["languages_above_random"], len(per)), flush=True)
         del ag; gc.collect()
         json.dump(results, open(OUT, "w"), indent=2)
+    for lg in sorted(suites):
+        results["part_a"]["paired_english_vs_multilingual"][lg] = mcnemar(
+            corr_by["english"][lg], corr_by["multilingual"][lg])
+    json.dump(results, open(OUT, "w"), indent=2)
 
 
 # ------------------------------------------------------------------ part B
 def build_typed_decisions():
     import pandas as pd
-    p = os.path.join(REPO, "typed-decisions", "all", "test-00000-of-00001.parquet")
-    df = pd.read_parquet(p)
+    df = pd.read_parquet(TYPED_DECISIONS)
     cases, gold, wfs = [], [], []
     for _, r in df.iterrows():
         qs = json.loads(r["questions"]); g = json.loads(r["gold"])
@@ -312,6 +453,10 @@ def main():
     ap.add_argument("--per-lang", type=int, default=120)
     ap.add_argument("--skip-a", action="store_true")
     ap.add_argument("--skip-b", action="store_true")
+    ap.add_argument("--distractors", choices=("random", "scenario"), default="random",
+                    help="scenario = same-scenario confusable intents first")
+    ap.add_argument("--criteria", choices=("rewrite", "key"), default="rewrite",
+                    help="option text: rewritten label or bare key (description ablation)")
     a = ap.parse_args()
 
     results = {"meta": {"timestamp": time.strftime("%Y-%m-%d %H:%M:%S"), "device": "cpu",
@@ -326,7 +471,7 @@ def main():
         langs = massive_languages()
         if a.langs:
             langs = langs[:a.langs]
-        run_part_a(results, langs, a.per_lang)
+        run_part_a(results, langs, a.per_lang, a.distractors, a.criteria)
     if not a.skip_b:
         run_part_b(results)
     json.dump(results, open(OUT, "w"), indent=2)

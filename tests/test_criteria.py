@@ -116,6 +116,42 @@ check_true("fallback/no bare cuda probe for the warning",
            "torch.cuda.is_available() or getattr(torch.version" not in _src)
 
 
+# --------------------------------------------------------------- option-budget truncation warning
+import warnings  # noqa: E402
+
+from laya.common import build_sequence  # noqa: E402
+
+
+class _Tok:
+    mask_token, mask_token_id, cls_token_id, sep_token_id = "[MASK]", 1, 2, 3
+
+    def __call__(self, text, add_special_tokens=False):
+        return {"input_ids": [10] * len(text.split())}
+
+
+def _warns(n_opts):
+    q = {"t": "choice", "ins": "pick one", "crit": {"label number %d here" % i: None for i in range(n_opts)}}
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        build_sequence(_Tok(), "state", q, 512, 192)
+    return any("exceed head_max_len" in str(x.message) for x in w)
+
+
+check_true("truncation/no warning for a few options", not _warns(5))
+check_true("truncation/warns when 77 options share the budget", _warns(77))
+
+
+# --------------------------------------------------------------- triage preset
+from laya import triage_questions  # noqa: E402
+
+tq = triage_questions()
+check_true("triage/default field is message", "`message`" in tq["intent"]["instructions"])
+check_true("triage/field is configurable",
+           all("`body`" in q["instructions"] for q in triage_questions(field="body").values()))
+check("triage/custom intents", triage_questions(intents={"a": "x", "b": "y"})["intent"]["criteria"],
+      {"a": "x", "b": "y"})
+
+
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 for f in FAIL:
     print("  FAIL " + f)

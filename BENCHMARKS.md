@@ -26,6 +26,10 @@ Every checkpoint answered **byte-identical questions** in each run (fixed seed).
 
 ### All 51 MASSIVE languages — intent, 20 options (random = 0.050)
 
+About 100 cases per language, so a single-language accuracy carries roughly ±0.09 (95%); treat
+small per-language gaps as noise. `bench_local.py` now reports `accuracy_ci95` per language and an
+exact McNemar test for the paired english-vs-multilingual comparison.
+
 | | laya | laya-multilingual |
 |---|---|---|
 | macro accuracy | 0.2269 | **0.3661** |
@@ -131,6 +135,13 @@ Each is real labelled data, 400 cases, all three checkpoints. *held out* means t
 | DAIR Emotion (6 labels) | 0.595 | 0.530 | **0.600** | 0.480 |
 | banking77 (77 labels) | 0.425 | 0.425 | **0.492** | 0.870 |
 
+> **Sampling caveat.** The numbers in this section were produced with `rows[:N]` sampling. The
+> banking77 test split is sorted by label (40 rows per label), so the 400 banking77 cases covered
+> only ~10 of the 77 intents, and support triage and phishing were scored on rows of their *train*
+> split. The harnesses now sample stratified by label and tag train-split suites with
+> `eval_split="train"`; these rows will be refreshed on the next run. Jev figures are third-party
+> published (different n, label count and prompts) and are context, not a controlled comparison.
+
 banking77 is the one clear loss, and it is architectural: a choice question's options share a fixed `head_max_len` budget, so 77 labels get roughly 4 tokens each and stop being distinguishable. Both checkpoints score **exactly 0.425**, which is what you would expect from a budget ceiling rather than a capability gap. Keep choice questions under ~20 options.
 
 ---
@@ -177,6 +188,10 @@ banking77 is the one clear loss, and it is architectural: a choice question's op
 | `laya-multilingual` | 0.314 | **0.106** |
 
 Both ship over-confident; `laya-multilingual` ships with no fitted temperatures at all. Refitting one temperature per (question type, option count) on held-out data is the single highest-value fix available, and takes ECE below Jev's measured 0.246.
+
+The refit column fits and evaluates on two halves of the *same* suite, so it is an in-distribution
+upper bound. The notebook now also reports `ece_loso` (temperatures fitted on every other suite)
+and a single pooled `global_temperatures` set, which is what a new task would actually see.
 
 ### Option-order robustness
 

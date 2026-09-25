@@ -227,7 +227,15 @@ safety = agent.predict({"post": "User comment text"}, laya.moderation_questions(
 
 # 4. Support Ticket Triage (intent, urgency, frustration, churn)
 triage = agent.predict({"message": "My payment failed twice"}, laya.triage_questions())
+
+# Custom intent labels, or a state that keeps the text under another key
+triage = agent.predict({"body": "Can I get a quote for 50 seats?"},
+                       laya.triage_questions(field="body"))
 ```
+
+Keep each `choice` question under ~20 options: all options share a `head_max_len` token budget, and
+`build_sequence` warns when options have to be truncated. For a large intent catalogue, ask a coarse
+question first (intent group) and then one question per group; the questions still run in one forward pass.
 
 ---
 
