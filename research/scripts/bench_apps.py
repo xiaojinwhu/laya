@@ -12,11 +12,10 @@ Workflows (the demo Space's tabs), each on real labelled data:
 Jev-comparable tasks (AbdelStark/jev-benchmarks published Jev accuracy on these):
   ag_news 0.910 | banking77 0.870 | dair emotion 0.480 (Brier 0.846, NLL 5.588)
 
-  USE_TF=0 python3 notebooks/bench_apps.py
+  USE_TF=0 python3 research/scripts/bench_apps.py
 """
 import gc
 import json
-import math
 import os
 import random
 import sys
@@ -26,17 +25,17 @@ os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("USE_TORCH", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-import numpy as np  # noqa: E402
-import torch  # noqa: E402
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(REPO, "laya"))
-sys.path.insert(0, os.path.join(REPO, "notebooks"))
+HERE = os.path.dirname(os.path.abspath(__file__))
+RESEARCH = os.path.dirname(HERE)
+sys.path.insert(0, os.path.dirname(RESEARCH))
+sys.path.insert(0, HERE)
 
 import laya  # noqa: E402
-from bench_local import load, metrics, score_cases, softmax_t, temp_for  # noqa: E402
+from bench_local import (load, metrics, option_flip_rate, sample_rows, score_cases,  # noqa: E402
+                         softmax_t, temp_for)
 
-OUT = os.path.join(REPO, "app_benchmark_results.json")
+OUT = os.path.join(RESEARCH, "results", "app_benchmark_results.json")
 SEED = 13
 N = int(os.environ.get("BENCH_N", "400"))
 
@@ -80,7 +79,7 @@ def build():
                 "business": "business and economy", "sci_tech": "science and technology"}
         keys = list(crit)
         cases, gold = [], []
-        for r in list(d)[:N]:
+        for r in sample_rows(list(d), N, lambda r: r["label"]):
             cases.append(({"article": r["text"]},
                           {"topic": {"type": "choice", "instructions": "What is the topic of `article`?",
                                      "criteria": dict(crit)}}))
@@ -94,7 +93,7 @@ def build():
         d = load_dataset("dair-ai/emotion", "split", split="test")
         names = ["sadness", "joy", "love", "anger", "fear", "surprise"]
         cases, gold = [], []
-        for r in list(d)[:N]:
+        for r in sample_rows(list(d), N, lambda r: r["label"]):
             cases.append(({"text": r["text"]},
                           {"emotion": {"type": "choice",
                                        "instructions": "Which emotion is most strongly expressed in `text`?",
@@ -110,7 +109,7 @@ def build():
         d = load_dataset("mteb/banking77", split="test")
         labels = sorted(set(d["label_text"]))
         cases, gold = [], []
-        for r in list(d)[:N]:
+        for r in sample_rows(list(d), N, lambda r: r["label_text"]):
             qs, gi = choice_q("intent", "Which banking intent does `message` express?",
                               [x.replace("_", " ") for x in labels],
                               r["label_text"].replace("_", " "))
@@ -136,17 +135,15 @@ def build():
                   "General Inquiry": "anything else"}
         keys = list(QUEUES)
         cases, gold = [], []
-        for r in d:
-            if r.get("language") != "en" or r.get("queue") not in QUEUES or not r.get("body"):
-                continue
+        rows = [r for r in d if r.get("language") == "en" and r.get("queue") in QUEUES and r.get("body")]
+        for r in sample_rows(rows, N, lambda r: r["queue"]):
             cases.append(({"subject": r["subject"] or "", "body": r["body"].replace("\\n", "\n")[:3000]},
                           {"queue": {"type": "choice",
                                      "instructions": "Which support queue should handle this ticket?",
                                      "criteria": dict(QUEUES)}}))
             gold.append(keys.index(r["queue"]))
-            if len(cases) >= N:
-                break
-        register("app.support_triage", cases, gold, note="10-way queue routing", in_training=True)
+        register("app.support_triage", cases, gold, note="10-way queue routing (train split)",
+                 in_training=True, eval_split="train")
     except Exception as e:
         print("   FAIL support_triage", str(e)[:80])
 
@@ -154,7 +151,7 @@ def build():
     try:
         d = load_dataset("SetFit/enron_spam", split="test")
         cases, gold = [], []
-        for r in list(d)[:N]:
+        for r in sample_rows(list(d), N, lambda r: r["label"]):
             st = laya.email_state(r.get("subject") or "", (r.get("message") or "")[:3000])
             cases.append((st, {"is_spam": {"type": "noul",
                                            "instructions": "Is this email unsolicited spam or bulk marketing?"}}))
@@ -165,7 +162,7 @@ def build():
 
     try:
         d = load_dataset("zefang-liu/phishing-email-dataset", split="train")
-        rows = [r for r in list(d)[:6000]
+        rows = [r for r in d
                 if (r.get("Email Text") or "").strip() and r.get("Email Type") in ("Safe Email", "Phishing Email")]
         rng.shuffle(rows)
         cases, gold = [], []
@@ -176,7 +173,8 @@ def build():
                                            "criteria": {"true": "phishing, scam, or fraud",
                                                         "false": "a legitimate email (even if promotional)"}}}))
             gold.append(int(r["Email Type"] == "Phishing Email"))
-        register("app.phishing", cases, gold, note="phishing emails", in_training=True)
+        register("app.phishing", cases, gold, note="phishing emails (train split)", in_training=True,
+                 eval_split="train")
     except Exception as e:
         print("   FAIL phishing", str(e)[:80])
 
@@ -245,11 +243,11 @@ def build():
         keys = list(DOM)
         pool = []
         g = load_dataset("openai/gsm8k", "main", split="test")
-        pool += [(r["question"], "math_or_logic") for r in list(g)[:N // 3]]
+        pool += [(r["question"], "math_or_logic") for r in rng.sample(list(g), N // 3)]
         m = load_dataset("google-research-datasets/mbpp", "full", split="test")
-        pool += [(r["text"], "code") for r in list(m)[:N // 3]]
+        pool += [(r["text"], "code") for r in rng.sample(list(m), N // 3)]
         t = load_dataset("fancyzhx/ag_news", split="test")
-        pool += [(r["text"][:400], "factual_lookup") for r in list(t)[:N // 3]]
+        pool += [(r["text"][:400], "factual_lookup") for r in rng.sample(list(t), N // 3)]
         rng.shuffle(pool)
         cases, gold = [], []
         for text, dom in pool[:N]:
@@ -282,6 +280,8 @@ def main():
                 m["seconds"] = round(secs, 1)
                 m["ms_per_case"] = round(1000 * secs / max(1, len(S["cases"])), 1)
                 m["dropped"] = dropped
+                if any(q["type"] == "choice" for _, qs in S["cases"][:1] for q in qs.values()):
+                    m["option_order"] = option_flip_rate(ag, S["cases"])
                 m.update({k: v for k, v in S["meta"].items() if k != "note"})
                 results["suites"].setdefault(sname, {})[mname] = m
                 jev = JEV_PUBLISHED.get(S["meta"].get("jev") or "", {}).get("accuracy")

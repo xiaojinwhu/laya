@@ -2,6 +2,7 @@
 import json
 import math
 import os
+import warnings
 from typing import Dict, List, Optional, Union
 
 import numpy as np
@@ -70,6 +71,12 @@ def build_sequence(
     opt_budget = head_max_len - sum(len(o) for o in opt_ids)
     if opt_budget < 16:
         per = max(4, (head_max_len - 16) // max(1, len(opt_ids)))
+        warnings.warn(
+            "%d options exceed head_max_len=%d; each option is truncated to %d tokens and may no longer "
+            "be distinguishable. Split large label sets into a coarse question and per-group questions."
+            % (len(opt_ids), head_max_len, per),
+            stacklevel=2,
+        )
         opt_ids = [o[:per] for o in opt_ids]
         opt_budget = head_max_len - sum(len(o) for o in opt_ids)
     head_ids = head_ids[: max(8, opt_budget)]

@@ -262,6 +262,7 @@ def hard_metrics(rows):
     corr = (pred == gold).astype(float)
     m = {"n": len(rows),
          "accuracy": float(corr.mean()),
+         "accuracy_ci95": bootstrap_ci(corr),
          "macro_f1": macro_f1(gold, pred),
          "ece": ece_score(conf, corr),
          "brier": float(np.mean([((np.asarray(p) - np.eye(len(p))[g])**2).sum() for g, p in rows])),
@@ -272,6 +273,34 @@ def hard_metrics(rows):
         k = max(1, int(len(conf)*cov))
         m["acc_at_%d_coverage" % int(cov*100)] = float(corr[np.argsort(-conf)[:k]].mean())
     return m
+
+def sample_rows(rows, n, label_fn, seed=13):
+    '''Up to n rows stratified by label (shuffled per label, taken round-robin). HF test splits
+    are often sorted by label -- banking77 is 40 rows per label in label order.'''
+    import random
+    rng = random.Random(seed)
+    by_label = {}
+    for r in rows:
+        by_label.setdefault(label_fn(r), []).append(r)
+    pools = [by_label[k] for k in sorted(by_label, key=str)]
+    for p in pools:
+        rng.shuffle(p)
+    rng.shuffle(pools)
+    out, i = [], 0
+    while len(out) < n and any(i < len(p) for p in pools):
+        out.extend(p[i] for p in pools if i < len(p))
+        i += 1
+    out = out[:n]
+    rng.shuffle(out)
+    return out
+
+def bootstrap_ci(corr, n_boot=1000, seed=13):
+    corr = np.asarray(corr, float)
+    if len(corr) == 0:
+        return [float("nan"), float("nan")]
+    rs = np.random.RandomState(seed)
+    means = corr[rs.randint(0, len(corr), (n_boot, len(corr)))].mean(1)
+    return [float(np.percentile(means, 2.5)), float(np.percentile(means, 97.5))]
 
 def fit_temperature(pairs, lo=0.2, hi=10.0, steps=160):
     '''pairs: [(logits, gold_idx)] -> single temperature minimising NLL (grid search, no autograd).'''
@@ -301,6 +330,7 @@ checkpoints answer byte-identical questions. Option sets for many-label tasks us
 import random, json
 import numpy as np
 from datasets import load_dataset
+from bench_engine import sample_rows
 
 SEED = 13
 N_OPTS = 20          # options per many-label choice question (gold + 19 distractors)
@@ -373,7 +403,7 @@ for task, short, instr in [("mteb/amazon_massive_intent", "massive_intent",
             labels = sorted(set(d["label_text"]))
             rng = random.Random(SEED)
             cases, golds = [], []
-            for r in list(d)[:PER_LANG]:
+            for r in sample_rows(list(d), PER_LANG, lambda r: r["label_text"]):
                 qs, gi = build_choice_questions(rng, r["label_text"], labels, N_OPTS, instr)
                 cases.append(({"utterance": r["text"]}, qs))
                 golds.append({"label": {"idx": gi}})
@@ -389,7 +419,7 @@ for lg in XNLI_LANGS:
     try:
         d = load_dataset("facebook/xnli", lg, split="test")
         cases, golds = [], []
-        for r in list(d)[:PER_LANG]:
+        for r in sample_rows(list(d), PER_LANG, lambda r: r["label"]):
             qs = {"relation": {"type": "choice",
                                "instructions": "What is the relationship between `premise` and `hypothesis`?",
                                "criteria": dict(NLI_CRIT)}}
@@ -414,7 +444,7 @@ try:
     d = load_dataset("SetFit/sst5", split="test")
     crit = ["very negative", "negative", "neutral", "positive", "very positive"]
     cases, golds = [], []
-    for r in list(d)[:600]:
+    for r in sample_rows(list(d), 600, lambda r: r["label"]):
         cases.append(({"text": r["text"]},
                       {"sentiment": {"type": "score", "instructions": "How positive is the sentiment of `text`?",
                                      "criteria": crit}}))
@@ -427,7 +457,7 @@ try:
     d = load_dataset("dair-ai/emotion", "split", split="test")
     names = ["sadness","joy","love","anger","fear","surprise"]
     cases, golds = [], []
-    for r in list(d)[:600]:
+    for r in sample_rows(list(d), 600, lambda r: r["label"]):
         cases.append(({"text": r["text"]},
                       {"emotion": {"type": "choice",
                                    "instructions": "Which emotion is most strongly expressed in `text`?",
@@ -453,7 +483,7 @@ try:
     d = load_dataset("PolyAI/banking77", split="test")
     names = d.features["label"].names
     cases, golds = [], []
-    for r in list(d)[:500]:
+    for r in sample_rows(list(d), 500, lambda r: r["label"]):
         cases.append(({"message": r["text"]},
                       {"intent": {"type": "choice", "instructions": "Which banking intent does `message` express?",
                                   "criteria": {n.replace("_", " "): None for n in names}}}))
@@ -468,7 +498,7 @@ try:
     crit = {"world": "world news and international politics", "sports": "sports",
             "business": "business and economy", "sci_tech": "science and technology"}
     cases, golds = [], []
-    for r in list(d)[:600]:
+    for r in sample_rows(list(d), 600, lambda r: r["label"]):
         cases.append(({"article": r["text"]},
                       {"topic": {"type": "choice", "instructions": "What is the topic of `article`?",
                                  "criteria": dict(crit)}}))
@@ -479,7 +509,7 @@ except Exception as e: print("  FAIL ag_news:", str(e)[:90])
 try:
     d = load_dataset("google/boolq", split="validation")
     cases, golds = [], []
-    for r in list(d)[:600]:
+    for r in sample_rows(list(d), 600, lambda r: bool(r["answer"])):
         cases.append(({"passage": r["passage"], "question": r["question"]},
                       {"answer": {"type": "noul",
                                   "instructions": "Based on `passage`, is the answer to `question` yes?"}}))
@@ -679,11 +709,16 @@ for model_name in REPOS:
     md("""## 9. Calibration repair
 
 `laya-multilingual` ships with `temperature = [1.0, 1.0, 1.0]` and no per-option-count buckets —
-it was never calibrated. This refits one temperature per (question type, option-count bucket) on
-**half** of each suite and reports ECE on the other half, so the improvement is measured
-out-of-sample. It shows how much of any calibration gap is a missing post-processing step rather
-than a property of the model."""),
+it was never calibrated. This refits one temperature per (question type, option-count bucket) and
+reports ECE two ways:
+
+- `ece_refit` — fitted on a random half of the suite, evaluated on the other half (same distribution);
+- `ece_loso` — fitted on every *other* suite, evaluated on this one (leave-one-suite-out), which is
+  what a user applying shipped temperatures to a new task would see.
+
+`global_temperatures` are fitted once on all suites pooled — the single set you would ship."""),
     code("""
+import random
 import numpy as np
 import bench_engine as BE
 from laya.common import temp_bucket
@@ -691,7 +726,7 @@ from laya.common import temp_bucket
 RESULTS["calibration_repair"] = {}
 for model_name in REPOS:
     agent = globals()["AGENT_" + model_name.replace("-", "_")]
-    per_suite, fitted_all = {}, {}
+    pairs_by_suite = {}
     for sname, S in SUITES.items():
         if sname not in RAW[model_name]:
             continue
@@ -701,32 +736,45 @@ for model_name in REPOS:
             g = S["gold"][ci].get(qid)
             if g is not None and z is not None:
                 pairs.append((z, g["idx"], qt, k))
-        if len(pairs) < 60:
-            continue
+        if len(pairs) >= 60:
+            random.Random(SEED).shuffle(pairs)
+            pairs_by_suite[sname] = pairs
+
+    def fit_buckets(pairs):
+        buckets = {}
+        for z, gi, qt, k in pairs:
+            buckets.setdefault(temp_bucket(qt, k), []).append((z, gi))
+        return {b: BE.fit_temperature(v) for b, v in buckets.items() if len(v) >= 25}
+
+    def apply(pairs, temps):
+        return [(gi, BE.softmax_t(z, temps.get(temp_bucket(qt, k), BE.temp_for(agent, qt, k, True))))
+                for z, gi, qt, k in pairs]
+
+    per_suite = {}
+    for sname, pairs in pairs_by_suite.items():
         half = len(pairs)//2
         fit_set, held = pairs[:half], pairs[half:]
-        buckets = {}
-        for z, gi, qt, k in fit_set:
-            buckets.setdefault(temp_bucket(qt, k), []).append((z, gi))
-        fitted = {b: BE.fit_temperature(v) for b, v in buckets.items() if len(v) >= 25}
-        rows_ship, rows_fit = [], []
-        for z, gi, qt, k in held:
-            rows_ship.append((gi, BE.softmax_t(z, BE.temp_for(agent, qt, k, True))))
-            rows_fit.append((gi, BE.softmax_t(z, fitted.get(temp_bucket(qt, k),
-                                                            BE.temp_for(agent, qt, k, True)))))
-        ms, mf = BE.hard_metrics(rows_ship), BE.hard_metrics(rows_fit)
+        fitted = fit_buckets(fit_set)
+        others = [p for o, ps in pairs_by_suite.items() if o != sname for p in ps]
+        loso = fit_buckets(others)
+        ms, mf, ml = (BE.hard_metrics(apply(held, {})), BE.hard_metrics(apply(held, fitted)),
+                      BE.hard_metrics(apply(held, loso)))
         per_suite[sname] = {"n_heldout": ms["n"], "fitted_temperatures": fitted,
-                            "ece_shipped": ms["ece"], "ece_refit": mf["ece"],
-                            "nll_shipped": ms["nll"], "nll_refit": mf["nll"],
+                            "ece_shipped": ms["ece"], "ece_refit": mf["ece"], "ece_loso": ml["ece"],
+                            "nll_shipped": ms["nll"], "nll_refit": mf["nll"], "nll_loso": ml["nll"],
                             "accuracy": ms["accuracy"]}
-        fitted_all.update(fitted)
-    RESULTS["calibration_repair"][model_name] = {"per_suite": per_suite}
+    global_t = fit_buckets([p for ps in pairs_by_suite.values() for p in ps])
+    RESULTS["calibration_repair"][model_name] = {"per_suite": per_suite,
+                                                  "global_temperatures": global_t}
     if per_suite:
         a = float(np.mean([v["ece_shipped"] for v in per_suite.values()]))
         b = float(np.mean([v["ece_refit"] for v in per_suite.values()]))
+        c = float(np.mean([v["ece_loso"] for v in per_suite.values()]))
         RESULTS["calibration_repair"][model_name]["mean_ece_shipped"] = round(a, 4)
         RESULTS["calibration_repair"][model_name]["mean_ece_refit"] = round(b, 4)
-        print("%-22s mean ECE  shipped %.4f  ->  refit %.4f" % (model_name, a, b))
+        RESULTS["calibration_repair"][model_name]["mean_ece_loso"] = round(c, 4)
+        print("%-22s mean ECE  shipped %.4f  ->  refit (in-suite) %.4f | leave-one-suite-out %.4f"
+              % (model_name, a, b, c))
 """),
 
     md("## 10. Aggregate, save and download"),

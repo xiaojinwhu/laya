@@ -2,28 +2,36 @@
 from typing import Dict, Optional
 
 
-def triage_questions() -> Dict:
-    """Preset questions for customer support ticket triage."""
+def triage_questions(intents: Optional[Dict[str, str]] = None, field: str = "message") -> Dict:
+    """Preset questions for customer support ticket triage.
+
+    `intents` replaces the default intent labels; `field` names the state key holding the
+    customer's text. Refund and churn signals are separate `noul` questions, so intent labels
+    only describe what the customer is asking for.
+    """
+    intents = intents or {
+        "refund": "asks for money back or for a charge to be reversed",
+        "billing_question": "asks about an invoice, a charge, a plan or a payment method without asking for money back",
+        "technical_help": "reports a bug, outage or integration problem",
+        "sales_inquiry": "asks about pricing, quotes, upgrades or buying",
+        "how_to": "asks how to use a product or feature",
+        "cancellation": "asks to cancel or downgrade the account or subscription",
+        "other": "none of the other options fits",
+    }
+    ref = "`%s`" % field
     return {
         "intent": {
             "type": "choice",
-            "instructions": "What does the customer want in `message`?",
-            "criteria": {
-                "refund": "money returned or a duplicate charge reversed",
-                "technical_help": "a bug, outage or integration problem",
-                "billing_question": "a question about an invoice, plan or payment method",
-                "information": "general information, pricing or how-to",
-                "cancellation": "wants to cancel or downgrade",
-                "other": "none of the other options fits",
-            },
+            "instructions": "What does the customer want in %s?" % ref,
+            "criteria": intents,
         },
         "is_urgent": {
             "type": "noul",
-            "instructions": "Does `message` communicate time pressure or a deadline?",
+            "instructions": "Does %s communicate time pressure or a deadline?" % ref,
         },
         "frustration": {
             "type": "score",
-            "instructions": "How frustrated does the customer sound in `message`?",
+            "instructions": "How frustrated does the customer sound in %s?" % ref,
             "criteria": [
                 "calm and neutral",
                 "concerned but civil",
@@ -33,11 +41,11 @@ def triage_questions() -> Dict:
         },
         "refund_requested": {
             "type": "noul",
-            "instructions": "Does the customer ask for money back?",
+            "instructions": "Does the customer ask for money back in %s?" % ref,
         },
         "churn_risk": {
             "type": "noul",
-            "instructions": "Does `message` suggest the customer may leave for a competitor or cancel?",
+            "instructions": "Does %s suggest the customer may leave for a competitor or cancel?" % ref,
         },
     }
 
